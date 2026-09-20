@@ -1,0 +1,389 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Webhook Delivery & Self-Service API Security",
+    "output": "docs/architecture/adr/diagrams/adr-001-information-flow.html",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1380,
+      670
+    ]
+  },
+  "components": [
+    {
+      "id": "producers",
+      "type": "external",
+      "label": "Platform Producers",
+      "sublabel": "platform event sources",
+      "pos": [20, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "iam_sigv4",
+      "type": "security",
+      "label": "AWS IAM SigV4 Verifier",
+      "sublabel": "producer auth, not JWT",
+      "pos": [215, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "event_gateway",
+      "type": "backend",
+      "label": "Event Gateway",
+      "sublabel": "ingest, no outbound calls",
+      "pos": [410, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "sqs",
+      "type": "messagebus",
+      "label": "SQS Queue",
+      "sublabel": "transport only",
+      "pos": [800, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "delivery_worker",
+      "type": "backend",
+      "label": "Delivery Worker",
+      "sublabel": "virtual-thread attempt",
+      "pos": [995, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "gate",
+      "type": "backend",
+      "label": "Bulkhead + Breaker",
+      "sublabel": "resilience gate",
+      "pos": [1190, 50],
+      "size": [150, 50]
+    },
+    {
+      "id": "relay",
+      "type": "backend",
+      "label": "Relay / Dispatcher",
+      "sublabel": "SKIP LOCKED claim",
+      "pos": [605, 180],
+      "size": [150, 50]
+    },
+    {
+      "id": "dlq",
+      "type": "messagebus",
+      "label": "DLQ",
+      "sublabel": "maxReceiveCount exceeded",
+      "pos": [800, 180],
+      "size": [150, 50]
+    },
+    {
+      "id": "client_webhook",
+      "type": "external",
+      "label": "Client Webhook",
+      "sublabel": "client HTTPS endpoint",
+      "pos": [1190, 180],
+      "size": [150, 50]
+    },
+    {
+      "id": "dlq_consumer",
+      "type": "backend",
+      "label": "DLQ Consumer",
+      "sublabel": "sole writer of FAILED",
+      "pos": [800, 310],
+      "size": [150, 50]
+    },
+    {
+      "id": "notification_events",
+      "type": "database",
+      "label": "notification_events",
+      "sublabel": "the platform event, immutable",
+      "pos": [350, 440],
+      "size": [165, 85]
+    },
+    {
+      "id": "deliveries",
+      "type": "database",
+      "label": "deliveries",
+      "sublabel": "outbox: sole source of truth",
+      "pos": [545, 440],
+      "size": [165, 85]
+    },
+    {
+      "id": "subscriptions",
+      "type": "database",
+      "label": "subscriptions",
+      "sublabel": "URL, secret ref, breaker state",
+      "pos": [740, 440],
+      "size": [165, 85]
+    },
+    {
+      "id": "delivery_attempts",
+      "type": "database",
+      "label": "delivery_attempts",
+      "sublabel": "one row per HTTP attempt",
+      "pos": [935, 440],
+      "size": [165, 85]
+    },
+    {
+      "id": "api_client",
+      "type": "external",
+      "label": "API Client",
+      "sublabel": "tenant caller",
+      "pos": [20, 565],
+      "size": [150, 50]
+    },
+    {
+      "id": "edge_gateway",
+      "type": "cloud",
+      "label": "Edge / API Gateway",
+      "sublabel": "WAF, rate limit, TLS",
+      "pos": [215, 565],
+      "size": [190, 50]
+    },
+    {
+      "id": "filter_chain",
+      "type": "security",
+      "label": "SecurityFilterChain",
+      "sublabel": "JWT RS256, rate limit after auth, TenantId resolver",
+      "pos": [430, 550],
+      "size": [340, 80]
+    },
+    {
+      "id": "self_service_api",
+      "type": "backend",
+      "label": "Self-Service API",
+      "sublabel": "reads deliveries, replays via insert",
+      "pos": [900, 565],
+      "size": [170, 50]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Ingest identity: AWS IAM SigV4 (producer auth)",
+      "wraps": ["producers", "iam_sigv4"],
+      "pad": 14
+    },
+    {
+      "kind": "security-group",
+      "label": "Client API identity: JWT resource server (RS256)",
+      "wraps": ["api_client", "edge_gateway", "filter_chain", "self_service_api"],
+      "pad": 16
+    },
+    {
+      "kind": "security-group",
+      "label": "RLS fail-closed: SET LOCAL app.client_id, role challenge_api, no BYPASSRLS",
+      "wraps": ["notification_events", "deliveries", "subscriptions", "delivery_attempts"],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "from": "producers",
+      "to": "iam_sigv4",
+      "label": "SigV4-signed request",
+      "variant": "security",
+      "labelDy": 55
+    },
+    {
+      "from": "iam_sigv4",
+      "to": "event_gateway",
+      "label": "verified identity",
+      "variant": "security",
+      "labelDy": 55
+    },
+    {
+      "from": "event_gateway",
+      "to": "notification_events",
+      "label": "INSERT event + content (1 txn)",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": -10
+    },
+    {
+      "from": "event_gateway",
+      "to": "deliveries",
+      "label": "INSERT N rows PENDING (same txn)",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 12
+    },
+    {
+      "from": "event_gateway",
+      "to": "subscriptions",
+      "label": "READ active subscription (tenant-scoped)",
+      "route": "straight",
+      "labelAt": [700, 280]
+    },
+    {
+      "from": "event_gateway",
+      "to": "sqs",
+      "label": "best-effort publish",
+      "variant": "dashed"
+    },
+    {
+      "from": "relay",
+      "to": "deliveries",
+      "label": "UPDATE -> QUEUED (SKIP LOCKED claim)",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "relay",
+      "to": "sqs",
+      "label": "publish pointer"
+    },
+    {
+      "from": "sqs",
+      "to": "delivery_worker",
+      "label": "long-poll receive",
+      "labelAt": [960, 150]
+    },
+    {
+      "from": "delivery_worker",
+      "to": "gate",
+      "label": "attempt via gate",
+      "labelDy": 55,
+      "variant": "emphasis"
+    },
+    {
+      "from": "gate",
+      "to": "client_webhook",
+      "label": "outbound webhook (6-step backoff, jitter)",
+      "labelDy": 24,
+      "variant": "emphasis"
+    },
+    {
+      "from": "delivery_worker",
+      "to": "delivery_attempts",
+      "label": "INSERT per HTTP attempt",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": -10
+    },
+    {
+      "from": "delivery_worker",
+      "to": "deliveries",
+      "label": "UPDATE QUEUED->PROCESSING->DELIVERED/RETRYING/DEAD",
+      "route": "straight",
+      "labelAt": [900, 280]
+    },
+    {
+      "from": "delivery_worker",
+      "to": "subscriptions",
+      "label": "READ URL+secret; UPDATE on 404/410/429",
+      "route": "straight",
+      "labelAt": [900, 380]
+    },
+    {
+      "from": "sqs",
+      "to": "dlq",
+      "label": "redrive (count 3)",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "from": "dlq",
+      "to": "dlq_consumer",
+      "label": "read pointer",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "from": "dlq_consumer",
+      "to": "deliveries",
+      "label": "UPDATE -> FAILED (sole writer)",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "api_client",
+      "to": "edge_gateway",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "from": "edge_gateway",
+      "to": "filter_chain",
+      "label": "TLS + rate limit",
+      "variant": "security",
+      "labelAt": [400, 534]
+    },
+    {
+      "from": "filter_chain",
+      "to": "self_service_api",
+      "label": "TenantId (mandatory)",
+      "variant": "security",
+      "labelAt": [560, 540]
+    },
+    {
+      "from": "self_service_api",
+      "to": "delivery_attempts",
+      "label": "READ (full attempt history)",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": -10
+    },
+    {
+      "from": "self_service_api",
+      "to": "deliveries",
+      "label": "GET list/single (READ)",
+      "route": "straight",
+      "labelAt": [780, 555]
+    },
+    {
+      "from": "self_service_api",
+      "to": "deliveries",
+      "label": "POST /replay -> INSERT new row",
+      "route": "straight",
+      "labelAt": [780, 500]
+    },
+    {
+      "from": "self_service_api",
+      "to": "notification_events",
+      "label": "READ (joined for event body)",
+      "route": "straight",
+      "labelAt": [630, 555]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Delivery State Machine",
+      "items": [
+        "PENDING -> QUEUED -> PROCESSING: relay claims (SKIP LOCKED), worker leases the message",
+        "PROCESSING -> DELIVERED (2xx) | RETRYING (retryable) | DEAD (exhausted/non-retryable)",
+        "RETRYING -> QUEUED on next_attempt_at; stale QUEUED/PROCESSING -> FAILED via SQS DLQ",
+        "Terminal states DELIVERED, DEAD, FAILED stay distinct -- never collapsed into one"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Who Writes to deliveries",
+      "items": [
+        "4 tables, 4 distinct reader/writer sets -- see the edges above for the exact map",
+        "DLQ Consumer is the sole writer of FAILED; POST /replay only ever inserts, never mutates the DEAD row",
+        "Every writer changes one row via UPDATE ... WHERE status = <expected prior state>, or a plain INSERT"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Cross-tenant access -> 404 (never 403)",
+      "items": [
+        "A foreign resource id is indistinguishable from a nonexistent one",
+        "RLS filters the row out; the use case only ever sees Optional.empty()",
+        "401 no/bad auth, 403 valid token missing scope, 404 wrong tenant or missing id"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Retry Policy (delivery_worker -> gate -> client_webhook)",
+      "items": [
+        "Exponential backoff with jitter: 5s -> 30s -> 2m -> 10m -> 1h -> 6h, 6 steps, +/-20% jitter",
+        "2xx = DELIVERED. 3xx = DEAD, not followed. 400/422/401/403 = DEAD, no retry",
+        "404/410 = DEAD + deactivate subscription. 408/429/5xx/timeout = RETRYING",
+        "429 also sets subscriptions.throttled_until and does not count toward the circuit breaker"
+      ]
+    }
+  ]
+}
