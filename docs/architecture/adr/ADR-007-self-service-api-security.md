@@ -1,28 +1,28 @@
 ---
-id: ADR-002
+id: ADR-007
 title: Self-service API security - JWT resource server, structurally enforced tenant isolation, scope model and rate limiting
-status: Proposed
+status: Accepted
 date: 2026-09-20
 authors: software-architect (Atlas)
 supersedes:
 superseded_by:
 ---
 
-# ADR-002: Self-Service API Security - JWT Resource Server, Structurally Enforced Tenant Isolation, Scope Model and Rate Limiting
+# ADR-007: Self-Service API Security - JWT Resource Server, Structurally Enforced Tenant Isolation, Scope Model and Rate Limiting
 
 ## Status
 
-Proposed <!-- change only by the user: Proposed | Accepted | Rejected | Superseded by ADR-NNN -->
+Accepted <!-- change only by the user: Proposed | Accepted | Rejected | Superseded by ADR-NNN -->
 
 ## Context
 
-ADR-001 (`ADR-001-webhook-notification-delivery-outbox.md`, status `Proposed`) designs the delivery pipeline and names the security exposure of the public self-service API but explicitly defers the design: its OWASP table says "Named here, not designed here" for A01 (IDOR and SSRF), A05, A07 and A09, and its Consequences section lists "the Spring Security and SSRF-defense design (security-engineer)" as unblocked work. This ADR designs the authentication, authorization and tenant-isolation half of that. It does **not** design the SSRF/egress controls (outbound direction), the webhook signing scheme, or producer authentication for the ingest endpoint - those are separate follow-ups and are only referenced here where a boundary has to be drawn.
+ADR-001 through ADR-006 (the delivery-pipeline design, all status `Accepted`) name the security exposure of the public self-service API but explicitly defer the design: their OWASP rows say "Named here, not designed here" for A01 (IDOR and SSRF), A05, A07 and A09, and ADR-001's Consequences section lists "the Spring Security and SSRF-defense design (security-engineer)" as unblocked work. This ADR designs the authentication, authorization and tenant-isolation half of that. It does **not** design the SSRF/egress controls (outbound direction), the webhook signing scheme, or producer authentication for the ingest endpoint - those are separate follow-ups and are only referenced here where a boundary has to be drawn.
 
-**This ADR depends on ADR-001 being Accepted.** ADR-001 is currently `Proposed`. If ADR-001 is rejected or materially changed, the endpoint surface and the `client_id`-keyed data model this ADR is written against change with it.
+**This ADR depends on ADR-001 through ADR-006, all `Accepted`.** If any of them is later superseded or materially changed, the endpoint surface and the `client_id`-keyed data model this ADR is written against change with it.
 
 ### The surface being secured
 
-From ADR-001 section 5, three client-facing endpoints, all reading the `deliveries` table joined to `notification_events`:
+From ADR-005 section 1, three client-facing endpoints, all reading the `deliveries` table joined to `notification_events`:
 
 | Endpoint | Nature |
 | --- | --- |
@@ -32,9 +32,9 @@ From ADR-001 section 5, three client-facing endpoints, all reading the `deliveri
 
 Plus surfaces that are **not** part of this chain and must not accidentally inherit its rules:
 
-- The producer ingest endpoint (ADR-001 section 1.1, Q10): platform-internal callers authenticating with AWS IAM SigV4, a different caller and a different identity system. No shared credential with the client API.
-- Actuator (ADR-001 section 8.1): liveness and readiness probes are called by an orchestrator with no token; metrics and every other actuator endpoint are operator surface.
-- The relay, worker and DLQ consumer (ADR-001 sections 6.1, 6.2): background beans with no HTTP request and therefore no authenticated principal at all. They legitimately operate across every tenant.
+- The producer ingest endpoint (ADR-002 section 1.1, Q10): platform-internal callers authenticating with AWS IAM SigV4, a different caller and a different identity system. No shared credential with the client API.
+- Actuator (ADR-002 section 3.1): liveness and readiness probes are called by an orchestrator with no token; metrics and every other actuator endpoint are operator surface.
+- The relay, worker and DLQ consumer (ADR-002 sections 2.1, 2.2): background beans with no HTTP request and therefore no authenticated principal at all. They legitimately operate across every tenant.
 
 ### Constraints fixed before this decision
 
@@ -47,11 +47,11 @@ Plus surfaces that are **not** part of this chain and must not accidentally inhe
 
 ### The problem that actually needs solving
 
-Authentication is the easy half: `oauth2ResourceServer().jwt()` plus a public key is a handful of configuration lines. The hard half is the one ADR-001's A01 row names, and it is a design problem rather than a configuration problem:
+Authentication is the easy half: `oauth2ResourceServer().jwt()` plus a public key is a handful of configuration lines. The hard half is the one the delivery design's A01 (IDOR) exposure names, and it is a design problem rather than a configuration problem:
 
 > a missing per-resource tenant check leaks or replays another client's notification
 
-ADR-001 states the rule correctly ("every query filters by the authenticated `client_id` ... never from a request parameter") but states it as a rule. A rule is enforced by whoever remembers it. The service will grow endpoints, and the failure mode is silent: an unfiltered query returns rows and passes every test written against a single-tenant fixture. The requirement from the user is explicit on this point - the tenant filter must be structurally enforced, such that the unfiltered path is uncompilable or unreachable, not merely discouraged.
+ADR-005 states the rule correctly ("every query filters by the authenticated `client_id` ... never from a request parameter") but states it as a rule. A rule is enforced by whoever remembers it. The service will grow endpoints, and the failure mode is silent: an unfiltered query returns rows and passes every test written against a single-tenant fixture. The requirement from the user is explicit on this point - the tenant filter must be structurally enforced, such that the unfiltered path is uncompilable or unreachable, not merely discouraged.
 
 ## Options Considered
 
@@ -85,7 +85,7 @@ Two independent decisions are recorded here: how tokens are validated (T), and h
 - Cons:
   - The corporate IdP is a given in this environment and already issues JWTs; mTLS would mean a parallel identity system with its own issuance, distribution and revocation story, for the same set of clients.
   - Terminating mTLS is typically a load balancer concern, so the application would still be reading a header it has to trust, which reintroduces the same trust-boundary question with less tooling around it.
-  - Rejected as duplicative, not as unsound. Same reasoning ADR-001 Q10 used to pick IAM over a bespoke internal credential: ride the identity system that already exists.
+  - Rejected as duplicative, not as unsound. Same reasoning ADR-002's Q10 used to pick IAM over a bespoke internal credential: ride the identity system that already exists.
 
 ### I-A: Convention plus code review ("always add `WHERE client_id = ?`")
 
@@ -114,7 +114,7 @@ Enable RLS on the tenant-owned tables with a policy of the shape `client_id = cu
 - Pros:
   - Closes exactly the gap I-B leaves open: a query that forgets the predicate returns zero rows instead of another tenant's rows. The unfiltered path is *unreachable* even when it compiles, including for raw `JdbcTemplate` SQL.
   - Fails closed by construction: if the session variable was never set, the policy matches nothing.
-  - The database, which already is the single source of truth (ADR-001 section 0), becomes the single point of enforcement as well.
+  - The database, which already is the single source of truth (ADR-001 section 1), becomes the single point of enforcement as well.
 - Cons:
   - Requires role discipline: RLS is bypassed by the table owner and by a `BYPASSRLS` or superuser role, so the application must not connect as either.
   - The internal pipeline (ingest, relay, worker, DLQ consumer) is legitimately cross-tenant and must not be subject to the policy, which means two database roles and therefore two connection pools, or role switching per transaction.
@@ -186,8 +186,8 @@ Four properties hold by construction rather than by discipline:
 
 | Order | Chain | Matches | Rules |
 | --- | --- | --- | --- |
-| 1 | Actuator | `/actuator/**` | `/actuator/health/liveness`, `/actuator/health/readiness` and `/actuator/health` permitted with no authentication (orchestrator probes carry no token, ADR-001 section 8.1). **Every other actuator endpoint**, `/actuator/metrics`, `/actuator/prometheus`, `/actuator/env`, `/actuator/loggers` and the rest, requires authentication and the `ops` authority, and is additionally expected to be unreachable from the public ingress (a deployment concern, stated here so the devops task owns it). Health details (`management.endpoint.health.show-details`) set to `never` for unauthenticated callers: a probe needs the status code, not the component breakdown, and the breakdown names internal dependencies (A02). |
-| 2 | Ingest | `/internal/**` (ADR-001 section 1.1 producer endpoint) | AWS IAM SigV4 verification, per ADR-001 Q10. **Explicitly not the JWT chain.** This ADR does not design that verification; it reserves the path prefix and states that this chain is `authenticated()` with a distinct authentication mechanism and no client JWT accepted. Flagged for the security-engineer follow-up. |
+| 1 | Actuator | `/actuator/**` | `/actuator/health/liveness`, `/actuator/health/readiness` and `/actuator/health` permitted with no authentication (orchestrator probes carry no token, ADR-002 section 3.1). **Every other actuator endpoint**, `/actuator/metrics`, `/actuator/prometheus`, `/actuator/env`, `/actuator/loggers` and the rest, requires authentication and the `ops` authority, and is additionally expected to be unreachable from the public ingress (a deployment concern, stated here so the devops task owns it). Health details (`management.endpoint.health.show-details`) set to `never` for unauthenticated callers: a probe needs the status code, not the component breakdown, and the breakdown names internal dependencies (A02). |
+| 2 | Ingest | `/internal/**` (ADR-002 section 1.1 producer endpoint) | AWS IAM SigV4 verification, per ADR-002's Q10. **Explicitly not the JWT chain.** This ADR does not design that verification; it reserves the path prefix and states that this chain is `authenticated()` with a distinct authentication mechanism and no client JWT accepted. Flagged for the security-engineer follow-up. |
 | 3 | Client API | `/notification_events/**` | The chain designed below. |
 | 4 | Terminal | `/**` | `denyAll()`. Anything not matched above is refused, so a new controller mapped to a new path is dead on arrival until someone deliberately adds it to a chain. This is the concrete meaning of deny by default: the default for an unlisted path is 403, not "whatever the last chain happened to say". |
 
@@ -238,7 +238,7 @@ This service validates; it never issues. The contract below is what a token must
 
 **Additional validation rules**
 
-- **Maximum token lifetime.** `exp - iat` must not exceed a configured ceiling (proposed: 1 hour; a proposal, not a derived number, in the same class as ADR-001's Q5 and Q7 tuning values). A correctly configured IdP will not issue longer, but this service should not be the component that accepts a 10-year token because an IdP client was misconfigured. Enforced as a validator, so the check exists here regardless of what the IdP does.
+- **Maximum token lifetime.** `exp - iat` must not exceed a configured ceiling (proposed: 1 hour; a proposal, not a derived number, in the same class as ADR-004's Q5 and ADR-006's Q7 tuning values). A correctly configured IdP will not issue longer, but this service should not be the component that accepts a 10-year token because an IdP client was misconfigured. Enforced as a validator, so the check exists here regardless of what the IdP does.
 - **`client_id` format.** Validated against a strict pattern (proposed: 1 to 64 characters, `[A-Za-z0-9_-]`, matching the sample data's `CLIENT001` shape from `docs/challenge/notification_events.json`). Two reasons. First, the value becomes a bound SQL parameter and a PostgreSQL session variable; binding is the injection defense (A05) and the format check is the second layer, particularly for the `SET LOCAL` path of section 5.3 where the value is a string literal in a session-configuration statement. Second, a malformed tenant should fail at the boundary with a clear 401 rather than several layers deeper as an empty result set.
 - **No authorization decision reads any other claim.** Roles, group memberships and organizational claims that the corporate IdP may include are ignored. Only `scope` drives authority, only `client_id` drives tenancy. Anything else in the token is, at most, logged.
 
@@ -254,7 +254,7 @@ This service validates; it never issues. The contract below is what a token must
 | `notifications:replay` | `POST /notification_events/{id}/replay` | Re-enters the delivery pipeline and causes real outbound traffic to the client's own endpoint. Strictly more dangerous and strictly more expensive than a read. |
 | `ops` | Non-health actuator endpoints | Operator surface, not a client scope. Never granted to a client token. |
 
-**Why replay is a separate scope rather than a role or a flag.** Replay is not a read with a side effect; it is a write that creates work in the pipeline (ADR-001 section 5: a new `PENDING` row that the relay will pick up and a worker will act on). A client that only needs to observe delivery status has no reason to hold the ability to generate outbound traffic, and the blast radius of a leaked read-only token should not include "can cause the platform to hammer my endpoint". Splitting the scope means the client chooses which credential goes where: the read scope in the dashboard, the replay scope in the narrower operational tool that actually needs it.
+**Why replay is a separate scope rather than a role or a flag.** Replay is not a read with a side effect; it is a write that creates work in the pipeline (ADR-005 section 1: a new `PENDING` row that the relay will pick up and a worker will act on). A client that only needs to observe delivery status has no reason to hold the ability to generate outbound traffic, and the blast radius of a leaked read-only token should not include "can cause the platform to hammer my endpoint". Splitting the scope means the client chooses which credential goes where: the read scope in the dashboard, the replay scope in the narrower operational tool that actually needs it.
 
 **Authority mapping.** A `JwtAuthenticationConverter` with a `JwtGrantedAuthoritiesConverter` configured with an **empty authority prefix** and the `scope`/`scp` claim as source, so the scope string `notifications:replay` becomes the authority `notifications:replay` verbatim. No `SCOPE_` prefix, so what is written in the security configuration is exactly what is written in the token and there is no prefix mismatch class of bug. Unknown scopes present in the token are mapped to authorities and simply never referenced by any rule.
 
@@ -291,11 +291,11 @@ and the resolver, not the handler, is what consults the security context. A deve
 | `DeliveryRepositoryPort` | `findByTenant(TenantId, DeliveryQuery)` returning a page; `findByIdForTenant(TenantId, DeliveryId)` returning `Optional<Delivery>`; `insertReplay(TenantId, ReplayCommand)` |
 | `DeliveryAttemptRepositoryPort` | `findByDeliveryForTenant(TenantId, DeliveryId)` returning a list, empty when absent |
 
-`Optional` and empty collections, never `null`, consistent with ADR-001's port conventions.
+`Optional` and empty collections, never `null`, consistent with ADR-005's port conventions.
 
 **There is no `findById(DeliveryId)`.** Not deprecated, not discouraged: absent. A developer who wants to load a delivery without a tenant has nothing to call, and adding such a method is a visible, reviewable change to a port interface rather than an invisible omission inside a SQL string. That is the "uncompilable" property, and it is the reason the parameter is on the port rather than being read from a thread-local inside the adapter: a thread-local would make the unfiltered call compile and then silently work in a test where the thread-local happened to be set.
 
-**The internal pipeline ports stay separate.** `SubscriptionRepositoryPort`, the relay's claim query and the worker's outcome writes are cross-tenant by design (ADR-001 sections 6.1, 6.2) and take no `TenantId`. They are separate interfaces from the client-facing ones, which is Interface Segregation doing real work here: the split is not stylistic, it is the boundary between "acts for one tenant" and "acts for the platform", and it is visible in the type system.
+**The internal pipeline ports stay separate.** `SubscriptionRepositoryPort`, the relay's claim query and the worker's outcome writes are cross-tenant by design (ADR-002 sections 2.1, 2.2) and take no `TenantId`. They are separate interfaces from the client-facing ones, which is Interface Segregation doing real work here: the split is not stylistic, it is the boundary between "acts for one tenant" and "acts for the platform", and it is visible in the type system.
 
 #### 5.3 Layer 3 - the tenant is bound into the SQL, and into the database session
 
@@ -311,7 +311,7 @@ RLS is enabled on the tenant-owned tables (`notification_events`, `deliveries`, 
 
 > `USING (client_id = current_setting('app.client_id', true))`
 
-Exact DDL, the `delivery_attempts` policy shape (which has no `client_id` column of its own and must therefore be expressed against its parent), and the interaction with ADR-001 section 9's monthly range partitioning are the DBA's call in the feature breakdown. Two properties are not the DBA's call and are fixed here:
+Exact DDL, the `delivery_attempts` policy shape (which has no `client_id` column of its own and must therefore be expressed against its parent), and the interaction with ADR-003 section 3's monthly range partitioning are the DBA's call in the feature breakdown. Two properties are not the DBA's call and are fixed here:
 
 - **It fails closed.** `current_setting('app.client_id', true)` returns `NULL` when the variable was never set, and `client_id = NULL` matches no row. A query that skipped layer 3 returns zero rows, never another tenant's rows. There is no configuration in which "forgot to set the tenant" degrades to "sees everything" (A10: the error path fails closed by construction rather than by an exception handler that someone has to write correctly).
 - **Two database roles, and the API's role must not bypass RLS.** RLS does not apply to a superuser, to a role with `BYPASSRLS`, or to the table owner unless `FORCE ROW LEVEL SECURITY` is set. So:
@@ -335,7 +335,7 @@ A foreign resource is indistinguishable from a nonexistent one. This is not an e
 | Valid token, missing the required scope | 403 |
 | Valid token and scope, id belongs to another tenant | **404**, identical to a nonexistent id |
 | Valid token and scope, id does not exist | 404 |
-| Valid token and scope, replay target is not `DEAD`, or a live row already exists for the pair | 409 (ADR-001 section 5) |
+| Valid token and scope, replay target is not `DEAD`, or a live row already exists for the pair | 409 (ADR-005 section 1) |
 
 The 409 case is worth a note, because it is the one place where a status code could leak: 409 is only ever reachable for a delivery the caller already owns, since a foreign id is 404 long before the state check runs. Order matters, and the use case must resolve the row tenant-scoped first and check state second.
 
@@ -352,21 +352,21 @@ The 409 case is worth a note, because it is the one place where a status code co
 
 This is why the rate-limit filter sits **after** the bearer-token filter in the chain (section 2, step 7). Placing it earlier would mean keying on something unauthenticated, which means an attacker chooses their own bucket.
 
-**Budgets (proposals, not derived from measured usage - the same caveat class as ADR-001's Q5 and Q7):**
+**Budgets (proposals, not derived from measured usage - the same caveat class as ADR-004's Q5 and ADR-006's Q7):**
 
 | Bucket | Limit | Reasoning |
 | --- | --- | --- |
-| Read, per `client_id` | 600 requests per minute, burst 60 | Polling delivery status is a legitimate high-frequency pattern; the bounded page size and default 30-day window (ADR-001 section 5) already cap per-request cost, so the limit protects against loops rather than against expense. |
-| Replay, per `client_id` | 10 per minute and 200 per day, burst 5 | Replay is a write that generates outbound traffic to the client's own endpoint. It is the one endpoint where an unbounded client can turn this platform into a load generator aimed at themselves, and it is the one the ADR-001 A07 row specifically calls out for rate limiting. Roughly two orders of magnitude tighter than reads, deliberately. |
+| Read, per `client_id` | 600 requests per minute, burst 60 | Polling delivery status is a legitimate high-frequency pattern; the bounded page size and default 30-day window (ADR-005 section 1) already cap per-request cost, so the limit protects against loops rather than against expense. |
+| Replay, per `client_id` | 10 per minute and 200 per day, burst 5 | Replay is a write that generates outbound traffic to the client's own endpoint. It is the one endpoint where an unbounded client can turn this platform into a load generator aimed at themselves, and it is the one the self-service API's A07 authentication exposure specifically calls out for rate limiting. Roughly two orders of magnitude tighter than reads, deliberately. |
 | Unauthenticated | Edge only | Nothing authenticated-adjacent is budgeted in-process; a request without a valid token is rejected at the filter and is the edge's problem. |
 
 **Behavior on exhaustion.** 429 with a `Retry-After` header and an RFC 9457 problem-detail body. The limiter is a filter, so the request never reaches a use case, a database connection or the pipeline. A 429 from this service is not recorded as a delivery event of any kind.
 
-**Implementation shape and its honest limitation.** In-process token buckets keyed by `(client_id, bucket)`, with bounded-size eviction so the key space cannot grow without limit (the tenant count is not known to this service and an unbounded map keyed by a claim is itself a denial-of-service vector). The buckets are **per pod**, so with N instances a client's effective budget is N times the configured number. This is the same bounded over-count that ADR-001 section 10.2 already accepts for the circuit breaker's pre-trip window, accepted here for the same reason: the alternative is Redis or a database round trip on every request, which is new infrastructure and new latency on the hot path to make an approximate control exact. The edge layer is where a globally exact limit belongs if one is ever genuinely needed. The per-pod divisor should be applied when configuring the numbers, and the effective global budget is what gets documented to clients.
+**Implementation shape and its honest limitation.** In-process token buckets keyed by `(client_id, bucket)`, with bounded-size eviction so the key space cannot grow without limit (the tenant count is not known to this service and an unbounded map keyed by a claim is itself a denial-of-service vector). The buckets are **per pod**, so with N instances a client's effective budget is N times the configured number. This is the same bounded over-count that ADR-006 section 1.2 already accepts for the circuit breaker's pre-trip window, accepted here for the same reason: the alternative is Redis or a database round trip on every request, which is new infrastructure and new latency on the hot path to make an approximate control exact. The edge layer is where a globally exact limit belongs if one is ever genuinely needed. The per-pod divisor should be applied when configuring the numbers, and the effective global budget is what gets documented to clients.
 
 **A03 note.** A token-bucket library (Bucket4j or equivalent) is a new dependency, which is exactly the category ADR-001's A03 row flags. Pinned version, dependency scanning in the build, and a conscious check that it introduces no transitive runtime surface beyond in-memory buckets. Writing the bucket by hand is also viable at this scale and avoids the dependency; the trade is a small amount of code against a supply-chain entry, and it is a backend-task decision, not an architectural one.
 
-**Not rate limiting, but adjacent and already handled.** The `Idempotency-Key` header on replay (ADR-001 section 5) and the partial unique index on `(event_id, subscription_id)` filtered to non-terminal statuses (ADR-001 sections 3 and 9) already prevent a double click from producing two live replays. Rate limiting is about volume; those are about correctness. Both are needed and neither substitutes for the other.
+**Not rate limiting, but adjacent and already handled.** The `Idempotency-Key` header on replay (ADR-005 section 1) and the partial unique index on `(event_id, subscription_id)` filtered to non-terminal statuses (ADR-003 sections 2 and 3) already prevent a double click from producing two live replays. Rate limiting is about volume; those are about correctness. Both are needed and neither substitutes for the other.
 
 ### 7. RSA public key per environment
 
@@ -402,10 +402,10 @@ There is deliberately no fallback, no default key, and no "if JWKS is unavailabl
 
 Stated explicitly so the boundaries are not inferred:
 
-- **SSRF and egress controls** for the outbound webhook call (ADR-001's A01-SSRF row). Different direction, different mechanism, its own follow-up.
-- **Producer authentication** for the ingest endpoint beyond reserving its path and its own filter chain. ADR-001 Q10 fixes the mechanism (IAM SigV4); the verification wiring is a security-engineer task.
-- **Webhook payload signing** (ADR-001's A02/A04 row) and the secret rotation window. Inbound authentication and outbound signing share no machinery.
-- **Subscription management authorization**, which does not exist as an API (ADR-001 Q9). When it does, `notifications:write` or similar is a third scope, and its tenant scoping rides layers 1 through 4 unchanged, which is the point of putting the enforcement in the structure rather than in each endpoint.
+- **SSRF and egress controls** for the outbound webhook call (ADR-002's A01-SSRF row). Different direction, different mechanism, its own follow-up.
+- **Producer authentication** for the ingest endpoint beyond reserving its path and its own filter chain. ADR-002's Q10 fixes the mechanism (IAM SigV4); the verification wiring is a security-engineer task.
+- **Webhook payload signing** (ADR-004 section 2) and the secret rotation window. Inbound authentication and outbound signing share no machinery.
+- **Subscription management authorization**, which does not exist as an API (Q9, `docs/architecture-overview.md`). When it does, `notifications:write` or similar is a third scope, and its tenant scoping rides layers 1 through 4 unchanged, which is the point of putting the enforcement in the structure rather than in each endpoint.
 - **The IdP's own configuration**: which clients exist, how they obtain tokens, token lifetimes at issuance, and scope grants. Out of scope by the user's framing.
 
 ## Consequences
@@ -430,7 +430,7 @@ Stated explicitly so the boundaries are not inferred:
 **Blocks / unblocks**
 
 - Unblocks: the backend task for the security configuration and the `TenantId` mechanism, the DBA task for RLS policies and the two-role migration, the devops task for per-environment key configuration and the secrets-scanning allow-list, and the security-engineer review of the whole chain.
-- Blocked by: **ADR-001, which is still `Proposed`.** No feature or task breakdown follows from this ADR until both are `Accepted`.
+- Blocked by: **ADR-001 through ADR-006** — no longer blocking; all seven ADRs (including this one) are now `Accepted`, so the feature/task breakdown can proceed.
 - Follow-up ADRs or tasks likely needed for: SSRF/egress controls, producer SigV4 verification, webhook signing and secret rotation, and subscription-management authorization when that API exists.
 
 ## OWASP / Security Impact
@@ -442,14 +442,14 @@ Stated explicitly so the boundaries are not inferred:
 | **A02 Security Misconfiguration** | Deny-by-default terminal chain plus deny-by-default inside the API chain (section 2). Actuator split so only health probes are unauthenticated and health details are hidden (section 2). Startup validator that refuses to boot on six specific misconfigurations, including a static key outside the local profile and a missing audience (section 7). No fallback trust anchor. |
 | **A03 Software Supply Chain Failures** | One new runtime dependency is introduced at most, a token-bucket library, and hand-rolling it is a viable alternative (section 6). Pinned version and dependency scanning, consistent with ADR-001's A03 row. The committed dev key requires a deliberate, documented secrets-scanner allow-list so the scanner stays credible. |
 | **A04 Cryptographic Failures** | RS256 only, enforced with an explicit single-algorithm allow-list so `alg: none` and HMAC algorithm confusion are rejected before verification. Minimum 2048-bit keys, checked at startup. JWKS with `kid` matching in production; the local static key is structurally incapable of shipping because it lives outside the artifact (section 7). |
-| **A05 Injection** | `client_id` from the token is format-validated at the boundary (section 3) and always a bound parameter in SQL, never concatenated (section 5.3). The format check is specifically load-bearing for the `SET LOCAL app.client_id` path, where the value reaches a session-configuration statement. Filter parameters remain bound and enum-validated per ADR-001's A05 row. |
+| **A05 Injection** | `client_id` from the token is format-validated at the boundary (section 3) and always a bound parameter in SQL, never concatenated (section 5.3). The format check is specifically load-bearing for the `SET LOCAL app.client_id` path, where the value reaches a session-configuration statement. Filter parameters remain bound and enum-validated per ADR-005's A05 row. |
 | **A06 Insecure Design** | The design premise of section 5: a rule that depends on a developer remembering it is not a control. The enforcement is in the type system and in the database, chosen so the correct path is also the easiest path, since an enforced path that is inconvenient gets routed around. |
 | **A07 Authentication Failures** | Every endpoint authenticated, no permit-all outside health probes. Required claims with explicit issuer, audience, expiry, maximum-lifetime and 30-second skew validation. Stateless, no session fixation surface. Identical 401 responses for every distinct validation failure, so failure reasons are not enumerable. |
-| **A09 Logging & Alerting Failures** | Authentication failures, authorization denials, and rate-limit rejections are logged structurally with `client_id`, `sub`, trace id and outcome. **The bearer token, its signature, and any key material are never logged**, at any level, consistent with ADR-001's A09 row on signature headers. Worth alerting on: a sustained 401 rate from one source, any 403 on the replay scope (a client attempting an operation it was never granted is a signal), and rate-limit exhaustion by client. |
+| **A09 Logging & Alerting Failures** | Authentication failures, authorization denials, and rate-limit rejections are logged structurally with `client_id`, `sub`, trace id and outcome. **The bearer token, its signature, and any key material are never logged**, at any level, consistent with ADR-002's A09 row on signature headers. Worth alerting on: a sustained 401 rate from one source, any 403 on the replay scope (a client attempting an operation it was never granted is a signal), and rate-limit exhaustion by client. |
 | **A10 Mishandling of Exceptional Conditions** | Every error path in this design fails closed. An unset tenant session variable matches zero rows rather than all rows. An unreachable JWKS produces 401s rather than a fallback to a weaker key. A misconfigured key or issuer prevents startup rather than degrading silently. An unmatched path is denied rather than defaulting to the last chain's rules. |
 
 ## Downstream
 
-Once **both this ADR and ADR-001 are Accepted**, the feature/task breakdown for this ADR lives at `docs/features/FEAT-002-api-security-and-tenant-isolation/`.
+Once **this ADR and ADR-001 through ADR-006 are all Accepted**, the feature/task breakdown for this ADR lives at `docs/features/FEAT-002-api-security-and-tenant-isolation/`.
 
 Anticipated task split, for sizing only, not a commitment before approval: the `TenantId` type and its resolver; the filter chain configuration and the startup validator; the JWT decoder, validators and authority mapper; the RLS migration and the two-role setup (DBA); the tenant-scoped port signature changes and their adapters; the rate-limit filter; the ArchUnit rules; the dev-key tooling and per-environment configuration (devops); and an end-to-end cross-tenant isolation test run through the non-bypassing database role.
