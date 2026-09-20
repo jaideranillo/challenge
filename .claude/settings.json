@@ -1,0 +1,9 @@
+{
+  "enabledPlugins": {
+    "qmd@qmd": true
+  },
+  "env": {
+    "KB_TYPE": "project",
+    "KB_TOPICS_PATH": ".claude/context/topics"
+  }
+}
