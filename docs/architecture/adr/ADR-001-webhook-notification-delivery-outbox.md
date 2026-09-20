@@ -1,0 +1,608 @@
+---
+id: ADR-001
+title: Webhook notification delivery via transactional outbox, queue transport and self-service API
+status: Proposed
+date: 2026-09-19
+authors: software-architect (Atlas)
+supersedes:
+superseded_by:
+---
+
+# ADR-001: Webhook Notification Delivery via Transactional Outbox, Queue Transport and Self-Service API
+
+## Status
+
+Proposed <!-- change only by the user: Proposed | Accepted | Rejected | Superseded by ADR-NNN -->
+
+## Context
+
+Cobre is an event-driven microservices platform (accounts, payments, transactions). A new capability is required: notify each client individually about platform events (balance update, event creation, payment received, etc.) by calling a client-specific HTTPS webhook URL.
+
+The case statement requires two halves:
+
+**A. Delivery pipeline**
+- Confirm via a subscription that an event must be delivered at all, and that the target client is the owner of the event (tenant isolation is called out as mandatory).
+- Deliver the notification to the client's HTTPS endpoint.
+- Handle delivery errors with an efficient retry strategy.
+- Persist final delivery information.
+- Near real-time observability so an internal monitoring team can detect behavior deviation and answer client complaints.
+
+**B. Self-service REST API**
+- `GET /notification_events` — list per client, filterable by event creation date and `delivery_status`.
+- `GET /notification_events/{notification_event_id}` — single event detail.
+- `POST /notification_events/{notification_event_id}/replay` — re-send a notification whose delivery has definitively failed.
+
+The sample payload at `docs/challenge/notification_events.json` fixes the externally visible shape: `{ event_id, event_type, content, delivery_date, delivery_status ("completed" | "failed"), client_id }`.
+
+Non-functional asks: scalability, resiliency, hexagonal architecture, Java/Spring Boot, and at least three OWASP Top 10 risks relevant to a publicly exposed API with mitigations.
+
+### Constraints that are already fixed by the project (CLAUDE.md)
+
+- Java 21, Spring Boot 4.1.1, Gradle, package root `com.cobre.challenge`.
+- Hexagonal layout: `domain/model` (framework-free) <- `application/port` + `application/usecase` <- `adapter/in/web` and `adapter/out/*`.
+- Blocking Spring MVC on virtual threads (`spring.threads.virtual.enabled=true`). No WebFlux, no reactive types.
+- Spring Data JDBC / `NamedParameterJdbcTemplate`. No JPA, no lazy loading, explicit SQL.
+- PostgreSQL is the only datastore. Dev services via `compose.yaml`; tests via Testcontainers.
+- OpenTelemetry + Micrometer tracing into a `grafana/otel-lgtm` stack, already wired.
+- One human developer. The design must be implementable by one person in reasonable time.
+
+### The design direction being formalized
+
+This ADR formalizes the user's own whiteboard design (`docs/challenge/proposal/Fase_1/High_Level_1.png`): `Producer -> Gateway -> DB -> Consumer -> Client`, where the `deliveries` table is an outbox and the single source of truth, and the queue (SQS in the sketch) is pure transport. This ADR does not propose a different architecture; it makes that one precise and names the parts that were ambiguous on the whiteboard (see **Assumptions and Open Questions**).
+
+Everything in this ADR about AWS SQS is an assumption: no infrastructure provider is pinned anywhere in the repository. The only place it is load-bearing is the `NotificationQueuePort` implementation; the rest of the design is queue-agnostic (see Open Questions Q1).
+
+## Options Considered
+
+### Option A: Direct synchronous delivery from the event consumer (no outbox)
+
+The service consumes a platform event, looks up the subscription, and performs the HTTPS POST inline, retrying in-process.
+
+- Pros:
+  - Least moving parts; fastest to implement.
+  - Lowest latency in the happy path.
+- Cons:
+  - No durable record of intent before the attempt: a crash mid-attempt loses the notification entirely.
+  - Retry state lives in memory, so retries do not survive a restart or a deploy.
+  - A slow or hanging client endpoint directly consumes the event-consumption capacity and back-pressures unrelated clients (noisy-neighbor).
+  - Cannot satisfy "store final delivery information" as a source of truth, nor `POST /replay`, without bolting a table on anyway.
+  - Fails the resiliency non-functional outright.
+
+### Option B: Persist to the queue first, treat the queue as the source of truth
+
+The gateway writes the delivery intent straight to SQS; workers consume, deliver, and only then write an audit row to Postgres.
+
+- Pros:
+  - Simple write path; queue provides fan-out and visibility timeouts for free.
+  - Native dead-letter queue support handles definitive failure.
+- Cons:
+  - Dual-write problem with no transaction: the platform event can be accepted and the enqueue can fail (or vice versa), silently losing notifications.
+  - The API endpoints (`GET` list/detail, `replay`) need a queryable, filterable store; a queue is not queryable, so a table is required regardless.
+  - Message retention caps (SQS: 14 days maximum) make the queue unusable as a system of record for delivery history.
+  - Replay of a definitively failed delivery becomes a DLQ-redrive operation rather than an API call against a row the client can see.
+
+### Option C: Transactional outbox in Postgres, queue as transport only (whiteboard design)
+
+The gateway validates the subscription and writes a `deliveries` row in the same transaction as accepting the event. A relay publishes a lightweight pointer message to SQS. Consumers claim rows with `SELECT ... FOR UPDATE SKIP LOCKED`, perform the HTTPS attempt on a virtual thread, and write the outcome back to the `deliveries` table. The queue only wakes consumers; losing a message loses nothing, because a sweeper re-publishes any row left in a non-terminal state past its `next_attempt_at`.
+
+- Pros:
+  - Single source of truth in Postgres: durable, queryable, filterable, directly backing all three API endpoints.
+  - No dual-write hazard: the delivery intent is committed with the event in one transaction.
+  - `SKIP LOCKED` gives safe horizontal scaling of consumers with no double-claim and no distributed lock service.
+  - At-least-once delivery semantics with an explicit, inspectable retry schedule that survives restarts and deploys.
+  - Replay is a state transition on an existing row, not an infrastructure operation.
+  - Queue outage degrades latency, not correctness: the sweeper keeps draining the outbox.
+- Cons:
+  - More components than Option A: gateway, relay, sweeper, consumer.
+  - The outbox table is a write-hot table needing index and retention discipline (partitioning, archival).
+  - Requires the DB to absorb the claim traffic; polling cadence needs tuning.
+  - At-least-once means clients must tolerate duplicates; this obligation must be documented and supported with a delivery id header.
+
+## Decision
+
+**Adopt Option C: a transactional outbox in PostgreSQL (`deliveries` table) as the single source of truth, with the queue as pure transport, `SELECT ... FOR UPDATE SKIP LOCKED` claiming, virtual-thread-based delivery workers, and a self-service REST API reading from the same table.**
+
+### 0. Core decision: the database is the source of truth, the queue is transport
+
+**Decision.** All delivery state lives in PostgreSQL. SQS carries a single delivery attempt pointer and nothing more. A message never represents the lifecycle of a delivery — the row does.
+
+**Why.** A queue cannot be queried, cannot be filtered by status, and deletes its own history (SQS retention caps at 14 days). The self-service API needs exactly those three things: query, filter, history. Making the queue authoritative would mean maintaining delivery state in two places that cannot be kept transactionally consistent — the dual-write hazard named in Option B's cons.
+
+**Consequences that follow from this and are not separately negotiable:**
+
+- **No separate outbox table.** `deliveries` is not a business table plus a parallel outbox table kept in sync — it *is* the outbox. There is exactly one write path: the gateway inserts the `deliveries` row (status `PENDING`) in the same DB transaction that accepts the event. There is no dual write between "record the delivery" and "enqueue the delivery" — only one of those is a write at all.
+- **Nothing is ever enqueued before it is committed.** The relay only ever reads rows that already exist and are already committed; it cannot publish a pointer message for a delivery that isn't durably recorded, because the row is the precondition for the publish, not a side effect of it.
+- **A message lost in SQS is recoverable; a row lost in PostgreSQL is not.** The design is built around that asymmetry, not around making the queue reliable. This is why the relay/sweeper's `SKIP LOCKED` claim over `deliveries` — not SQS redelivery — is the guaranteed-delivery path (§6): losing a message only costs latency, because the row it would have pointed to is still there and still due. There is no equivalent recovery path for a row that was never committed, which is exactly why the write-then-publish ordering above is non-negotiable.
+- **Duplicate enqueues are harmless and therefore not defended against with coordination.** Two pointer messages for the same `deliveries` row (relay double-publish, SQS at-least-once redelivery, the relay's own due-query racing a normal publish, §6.1) are safe by construction: the consumer's claim is `UPDATE ... WHERE status = 'QUEUED'` (the state-guard from §2.1/§3), so only the first claim succeeds — every subsequent claim attempt on an already-`PROCESSING` or already-terminal row affects zero rows and the consumer discards the message. No deduplication table, no message-id tracking, no exactly-once queue configuration is needed; the row's `status` column *is* the deduplication mechanism.
+
+### 0.1 Queue technology: SQS, not Kafka
+
+**Decision.** Amazon SQS Standard for the delivery queue, with a redrive policy to a DLQ.
+
+**Why not Kafka.** Kafka is a partitioned, ordered log. Webhook delivery is the opposite shape: independent per-message work, with retry horizons spanning seconds to hours, requiring isolation per destination.
+
+- **No native delay.** Retrying in 15 minutes means either sleeping the consumer (which blocks the partition) or building tiered retry topics by hand.
+- **Head-of-line blocking.** Partitioning by `client_id` means one client with a dead endpoint freezes every client sharing that partition.
+
+SQS Standard has no partitions, so a message reattempts on its own schedule and a failing destination never affects another. `DelaySeconds` covers short backoff natively; longer horizons are covered by the relay (§6), which the design needs regardless of queue choice.
+
+**Ordering is deliberately not offered.** FIFO would reintroduce head-of-line blocking within a message group and cap throughput, and staggered retries break ordering anyway — a retried event arrives after events that came later (§4, "Ordering"). Instead, the payload carries a per-client `sequence_number` (monotonic per `client_id`, assigned at ingest — see §9) so a client that cares can order or discard stale notifications on its own side. This does not change Q6: the platform still does not guarantee delivery order, it only gives the client the information needed to reconstruct it if they want to.
+
+**Not chosen: a managed webhook-delivery service** (e.g. a hosted outbound-webhook product). Correct answer for a real product on total cost of ownership; excluded here because building this mechanism is the exercise.
+
+### 1. Components and flow
+
+```mermaid
+flowchart LR
+  subgraph Producers["Platform (external)"]
+    P[Accounts / Payments / Transactions events]
+  end
+
+  subgraph AdapterIn["Adapter:In"]
+    GW[Event ingress adapter<br/>HTTP or queue listener]
+    API[REST controller<br/>/notification_events]
+    SW[Sweeper scheduler]
+    CONS[Queue listener<br/>long poll]
+  end
+
+  subgraph App["Application (use cases + ports)"]
+    UC1[RegisterNotificationEventUseCase]
+    UC2[DispatchPendingDeliveriesUseCase]
+    UC3[AttemptDeliveryUseCase]
+    UC4[QueryNotificationEventsUseCase]
+    UC5[ReplayDeliveryUseCase]
+  end
+
+  subgraph Domain["Domain"]
+    D[Delivery, DeliveryStatus,<br/>Subscription, NotificationEvent,<br/>RetryPolicy]
+  end
+
+  subgraph AdapterOut["Adapter:Out"]
+    REPO[(DeliveryRepositoryPort impl<br/>Spring Data JDBC / JdbcTemplate)]
+    SUBS[SubscriptionRepositoryPort impl]
+    Q[NotificationQueuePort impl<br/>SQS]
+    HTTP[WebhookClientPort impl<br/>RestClient over HTTPS]
+  end
+
+  PG[(PostgreSQL<br/>deliveries = OUTBOX / source of truth)]
+  SQS[[Queue: transport only]]
+  CL[Client webhook URL]
+
+  P --> GW --> UC1 --> REPO --> PG
+  UC1 --> SUBS
+  SW --> UC2 --> REPO
+  UC2 --> Q --> SQS
+  SQS --> CONS --> UC3 --> HTTP --> CL
+  UC3 --> REPO
+  API --> UC4 --> REPO
+  API --> UC5 --> REPO
+  UC5 --> Q
+  App --> Domain
+```
+
+Roles:
+
+| Component | Responsibility |
+| --- | --- |
+| Gateway (ingress adapter + `RegisterNotificationEventUseCase`) | Synchronous HTTP entry point for producers, no outbound calls. Validates, resolves subscriptions with tenant isolation built into the query itself, writes `notification_events` + `deliveries` rows in one transaction, responds `202`, then best-effort publishes to SQS. Full detail in §1.1. |
+| Relay / dispatcher (`DispatchPendingDeliveriesUseCase`) | Claim rows that are due (`PENDING`/`RETRYING` with `next_attempt_at <= now()`) with `SKIP LOCKED`, move them to `QUEUED`, publish a pointer message. Also acts as the sweeper that re-publishes rows whose queue message was lost. |
+| Consumer (queue listener + `AttemptDeliveryUseCase`) | Long-poll, load the row, transition to `PROCESSING`, perform the HTTPS POST on a virtual thread with strict timeouts, write the attempt outcome and the next state back to the table. Full per-message flow, including the claim/bulkhead/breaker/delete ordering, in §6.2. |
+| API (`adapter/in/web` + query/replay use cases) | Read from the same `deliveries` table; replay inserts a new `PENDING` row rather than mutating the terminal one (§5). |
+
+The relay and the consumer are separate processes logically, but in this single-module project they are beans in the same application; nothing in the design prevents splitting them later, because they communicate only through the table and the queue.
+
+### 1.1 Ingest path
+
+The gateway is the **only** synchronous entry point for producers. It makes no outbound HTTP call of any kind — that happens exclusively in the consumer (§1, §4). This also settles Q10: event ingress is a synchronous HTTP endpoint, not a queue listener.
+
+1. **Validate the event** — schema, and producer authentication (the platform-internal caller, not a client; a separate credential from the self-service API's client auth, §5's OWASP A07 row).
+2. **Resolve matching subscriptions.** The lookup is keyed on the event's `client_id`: the query predicate is `WHERE client_id = :event.client_id AND event_type = :event.event_type AND active`, not a fetch-then-compare. Tenant isolation is enforced **structurally, in the query itself** — there is no code path where a subscription belonging to a different client is ever materialized in memory and then checked; it is simply never returned by the query. This is stronger than the "fetch a subscription, then assert its `client_id` matches" pattern (an earlier draft of §3 read that way and has been corrected to match — see below).
+3. **One transaction:** insert the `notification_events` row (idempotent on `event_id` — the table's own primary key, `ON CONFLICT (event_id) DO NOTHING`) plus one `deliveries` row per matched subscription, each `PENDING`. Zero matches means the event is still stored (for audit/debugging) and nothing downstream happens — no error, no rejection.
+4. **Commit, respond `202 Accepted`.**
+5. **Best-effort `SendMessage` to SQS**, *after* the response has already been returned to the producer.
+
+**If the transaction in step 3 fails, nothing exists** — no `notification_events` row, no `deliveries` rows, no message. The producer's retry (at-least-once upstream, §3) hits the same idempotent insert and the failed attempt leaves no trace to reconcile.
+
+**If step 5 fails, the `deliveries` rows are already durable** (committed in step 3, before step 4's response was even sent) and the relay picks them up on its next sweep regardless (§0, §6 — "relay is the guaranteed path"). Step 5 is purely a latency optimization; losing it costs a poll interval, not correctness. **No network call is ever made inside a database transaction** — this is the same discipline §0's "nothing is ever enqueued before it is committed" already established, now stated for the ingest side specifically: the DB transaction (steps 1-3) and the queue publish (step 5) are strictly sequential and never share a unit of work.
+
+### 2. Delivery state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: subscription confirmed,<br/>row committed with event
+  PENDING --> QUEUED: relay claims (SKIP LOCKED)<br/>and publishes pointer
+  QUEUED --> PROCESSING: consumer claims message,<br/>lease acquired
+  PROCESSING --> DELIVERED: 2xx from client endpoint
+  PROCESSING --> RETRYING: retryable failure,<br/>attempts < max
+  PROCESSING --> DEAD: non-retryable failure<br/>or attempts exhausted
+  RETRYING --> QUEUED: next_attempt_at reached,<br/>relay re-publishes
+  QUEUED --> QUEUED: stale (relay's due-query,<br/>§6.1) re-publishes in place
+  PROCESSING --> QUEUED: stale (relay's due-query,<br/>§6.1) reclaims and re-publishes
+  QUEUED --> FAILED: maxReceiveCount exceeded,<br/>message reached SQS DLQ
+  PROCESSING --> FAILED: maxReceiveCount exceeded,<br/>message reached SQS DLQ
+  DELIVERED --> [*]
+  DEAD --> [*]
+  FAILED --> [*]
+```
+
+`DEAD` no longer transitions back to `PENDING`. Replay does not mutate the `DEAD` row at all — see the revised §5 and §9 below; the arrow that used to read `DEAD --> PENDING: POST /replay` is gone because replay creates a *new* `deliveries` row rather than resurrecting the old one, which is also what finally resolves the §5/§9 contradiction the architecture review (previous turn) flagged as its most severe finding.
+
+A stale `QUEUED`/`PROCESSING` row also no longer resets to `PENDING`: §6.1's due-query reclaims it directly back into `QUEUED` (status doesn't actually change for an already-`QUEUED` row, only `next_attempt_at` and a fresh publish; a stale `PROCESSING` row moves to `QUEUED`). This replaces what an earlier draft of this ADR called "lease expiry" with a single mechanism — the relay's own periodic due-query is both the normal dispatcher and the reclaim path, so there is no separate "lease" concept or column (consistent with §9 dropping `lease_owner`/`lease_expires_at`; this is the answer to how reclaim actually works without them).
+
+Justification per state:
+
+| State | Why it exists |
+| --- | --- |
+| `PENDING` | Committed intent that no worker owns yet. Separating it from `QUEUED` is what makes the outbox safe: a crash between commit and publish leaves the row visibly unclaimed and the sweeper picks it up. |
+| `QUEUED` | Handed to transport, not yet picked up. Distinguishing it from `PROCESSING` lets observability separate "queue is backed up" from "clients are slow". |
+| `PROCESSING` | A worker holds a lease and an HTTPS call is in flight. Needed to prevent a second worker double-sending, and to detect stuck/crashed workers via lease expiry. |
+| `RETRYING` | Failed but scheduled for another attempt at `next_attempt_at`. A separate state (rather than reusing `PENDING`) keeps "never attempted" and "attempted and failing" distinguishable in dashboards and in the API filter. |
+| `DELIVERED` | Terminal success. Maps to the sample data's `completed`. |
+| `DEAD` | Terminal, client-facing, business failure — the webhook was attempted and definitively failed (retries exhausted or non-retryable response). The only status `POST /replay` accepts as its input. Maps to the sample data's `failed`. |
+| `FAILED` | Terminal, internal failure — the *message* could not even be processed (poison payload, unhandled exception in the consumer), not a webhook outcome. Written by the DLQ consumer, not by `AttemptDeliveryUseCase`. Never client-visible via the public `delivery_status` vocabulary (§2's mapping table) and never accepted by `POST /replay` — an internal-failure row needs a code fix and an operator action, not a client retry. This reverses what §4's DLQ paragraph previously said ("a DLQ message does not change the row's state") — that was the design before this state existed; `FAILED` is the correction. **Recovery never mutates the `FAILED` row** (§2.1): once the underlying bug is fixed, an internal (non-public) recovery action inserts a *new* `deliveries` row — same insert-not-mutate shape as `POST /replay`'s handling of `DEAD` (§5), so a `FAILED` row's audit trail is preserved exactly like a `DEAD` row's, and the state diagram needs no new outgoing edge from `FAILED` for this — the new row simply re-enters through the existing `[*] --> PENDING` arc, same as any other insert. |
+
+Terminal states are `DELIVERED`, `DEAD`, and `FAILED`. `QUEUED`/`PROCESSING` have two different timeout paths that operate on different clocks and don't conflict: the relay's own due-query (fast, 5s cycle, §6.1) reclaims a stale row back into `QUEUED` for an ordinary re-publish; only after cumulative SQS receives exceed `maxReceiveCount` (proposed: 50, §10) does the message reach the DLQ and the row move to `FAILED` instead. A row can cycle through due-query reclaims dozens of times before that ceiling is hit — expected, not a bug.
+
+### 2.1 Who writes what
+
+| Actor | Write |
+| --- | --- |
+| Gateway | Insert `notification_events` row + N x `deliveries` rows (`PENDING`), one transaction. |
+| Relay | `PENDING`/`RETRYING` -> `QUEUED`, advances `next_attempt_at`. |
+| Worker (claim) | `QUEUED` -> `PROCESSING`, conditional on current status (`UPDATE ... WHERE status = 'QUEUED'`, the state-guard from §0/§3). |
+| Worker (2xx) | Insert `delivery_attempts` row, -> `DELIVERED`, sets `delivered_at`. |
+| Worker (retryable failure) | Insert `delivery_attempts` row, -> `RETRYING`, `attempt_count++`, sets `next_attempt_at` per §4/§10's schedule. |
+| Worker (budget exhausted / non-retryable) | -> `DEAD`, `next_attempt_at = NULL`. |
+| DLQ consumer | -> `FAILED` (only actor that ever writes this status; see §4's DLQ paragraph). |
+| `POST /replay` | Insert a **new** `deliveries` row in `PENDING`, `attempt_count = 0`, `origin = 'REPLAY'`, `replayed_from = <original DEAD row's delivery_id>` (§9). Never writes to the original row. |
+| Internal recovery (ops-triggered, not the public API) | Insert a **new** `deliveries` row in `PENDING`, `attempt_count = 0`, `origin = 'RECOVERED'`, `recovered_from = <original FAILED row's delivery_id>` (§9). Never writes to the original row — mirrors `POST /replay`'s insert-not-mutate shape, but is not client-triggerable: `FAILED` signals an application bug (§2, §4), so this is an operator action taken after the underlying bug is fixed, not a self-service endpoint. |
+
+Every writer above changes exactly one row's status via a conditional `UPDATE ... WHERE status = <expected prior state>` (or is an `INSERT`); this is the state-guard pattern from §0 applied uniformly, and it is what makes concurrent workers, relay instances, and a racing sweeper all safe without a lock service.
+
+**Public naming:** the sample file uses `delivery_status` values `completed` and `failed`. The API exposes a stable public vocabulary and maps internal states to it in the controller's mapping step (never leaking the domain enum):
+
+| Internal state | Public `delivery_status` |
+| --- | --- |
+| `PENDING`, `QUEUED`, `PROCESSING`, `RETRYING` | `pending` |
+| `DELIVERED` | `completed` |
+| `DEAD`, `FAILED` | `failed` |
+
+`FAILED` shares `DEAD`'s public status so a client sees the same "failed" outcome either way — the internal/business distinction (§2) is an operational concern, not something the client needs to reason about. `POST /replay` still rejects a `FAILED` row (409, §5): the public status looks identical to `DEAD`, but only `DEAD` is replay-eligible.
+
+The public vocabulary being a superset of the sample file's two values is an assumption; see Q4.
+
+### 3. Idempotency and tenant isolation at the gateway
+
+Both are gateway-side invariants, enforced before the row is written, inside the same transaction.
+
+**Tenant isolation (mandatory per the case).** Enforced structurally in the subscription-lookup query itself (§1.1): `SubscriptionRepositoryPort` is called with the event's `client_id` as part of the query predicate (`WHERE client_id = ? AND event_type = ? AND active`), not fetched broadly and checked afterward. A subscription belonging to a different client is never returned by the query, so there is no code path where it could be materialized and the post-hoc check forgotten. If there is no active subscription, the event is recorded as "not subscribed" and **no** `deliveries` row is written. This is the single point where a cross-tenant leak could originate, so it is enforced at the query boundary and in the use case (framework-free, unit-testable), not left to an adapter's discipline.
+
+**Idempotency.** The gateway relies on a **partial unique index** on `deliveries (event_id, subscription_id) WHERE status NOT IN ('DELIVERED', 'DEAD', 'FAILED')` (§9) — at most one *live* (non-terminal) row per `(event_id, subscription_id)` pair at any time, rather than a hard unique constraint. Re-ingesting the same platform event while its delivery is still live produces the same pair; the insert violates the partial index and the use case treats that as success (returning the existing delivery) rather than an error. Once a delivery reaches a terminal state, the pair is free again — which is exactly what lets `POST /replay` insert a second row for the same `(event_id, subscription_id)` after the first went `DEAD` (§5), while still blocking a second concurrent replay or a genuine duplicate ingest while one is in flight. This is the property the whiteboard's "identify/potency" box was after, now stated precisely enough to coexist with replay-as-insert.
+
+**Duplicate protection at the client.** Because the pipeline is at-least-once, the outbound request carries the delivery id and the attempt number in headers so the client can deduplicate. The client-facing contract is explicitly at-least-once, not exactly-once.
+
+### 4. Retry strategy
+
+- **Policy:** exponential backoff with jitter, expressed in the domain as a pure `RetryPolicy` (no Spring, no clock dependency beyond an injected `Clock`).
+- **Schedule:** `5s -> 30s -> 2m -> 10m -> 1h -> 6h`, 6 steps, each with ±20% jitter. Jitter is mandatory, not cosmetic: without it, a batch of deliveries that failed together (e.g. a shared upstream blip) retries in the same instant and re-DDoSes the same client endpoint that just recovered. These numbers are a proposal, not derived from measured client behavior; see Q5. See also §10 (Resilience policies) for how this composes with the circuit breaker and bulkhead.
+- **Redirects (3xx):** treated as `DEAD`, not followed. Two reasons: an unvalidated redirect is a standard vector for smuggling the request to an internal address after the original URL passed validation (SSRF, A01), and a receiver that redirects almost always means the client moved their endpoint without updating the subscription — a config problem, not a transient one.
+- **Response classification:**
+
+| Response | Action | Counts toward circuit breaker (§10) |
+| --- | --- | --- |
+| 2xx | `DELIVERED`, resets in-memory failure count | — |
+| 3xx | `DEAD` immediately, not followed (see above) | yes |
+| 400, 422 | `DEAD` immediately, no retry | no |
+| 401, 403 | `DEAD` immediately, no retry | no |
+| 404, 410 | `DEAD` immediately, **and deactivate the subscription** (`active = false`, §9) | no |
+| 408 | `RETRYING` | yes |
+| 429 | `RETRYING`, honoring `Retry-After` when present and sane, **and sets `throttled_until` on the subscription** (§9) | no |
+| 5xx | `RETRYING` | yes |
+| Timeout / connection reset / DNS failure / TLS failure | `RETRYING` | yes |
+
+  Only 2xx is success; a 200 carrying an error payload in the body is still `DELIVERED` — the contract is the status code, not the body (the body is opaque to this service beyond the truncated `response_excerpt` kept for audit, §9).
+
+  **404 and 410 both deactivate the subscription**, not just 410. A 404 at the client's registered URL is treated the same as 410 Gone: the endpoint no longer exists at that address, and continuing to schedule deliveries against it wastes worker capacity for something no retry count will ever fix. This is a deliberate choice, not the HTTP-spec-conservative reading (410 is a stronger, permanent signal; 404 could in principle be transient) — flagged as **Q12** below since subscription management is out of scope (Q9) and there is currently no client-facing way to reactivate a subscription the platform deactivated this way.
+
+  **429 does not count toward the circuit breaker.** A 429 is the client explicitly asking to slow down — a rate-limit signal, not evidence the endpoint is down. It is deliberately escalated to the *subscription* (`throttled_until`, §9) rather than handled per-delivery, so every other in-flight delivery for that client also stops instead of each one independently rediscovering the same 429. Folding 429 into the breaker's failure count would risk tripping the breaker (and its exponential cooldown, §10) off ordinary, healthy rate-limiting.
+
+  **Outcomes that count toward the circuit breaker are availability signals** — 5xx, 408, timeout/connection/DNS/TLS failure, and 3xx (a redirect from what should be a static webhook target is itself a signal something changed). **Outcomes that don't** are either permanent/business (400, 401, 403, 404, 410, 422 — the endpoint is telling us the request is wrong, not that it's down) or already handled by a more specific mechanism (429 -> throttle, not breaker). This is the concrete definition of "failure" behind §10's "in-memory per-subscription failure count," which the earlier draft of §10 left unstated.
+
+- **Non-HTTP non-retryable cases** (-> `DEAD` immediately, not covered by the response table above since no response was received): subscription deactivated between scheduling and attempt, and a URL that fails the egress allow-list check at attempt time.
+- **Exhaustion:** reaching `max_attempts` moves the row to `DEAD`.
+- **Per-attempt timeouts** are mandatory (proposed: 2s connect, 5s read) so one hanging client cannot hold a lease or a worker indefinitely.
+- **Attempt history:** each attempt writes a row to a `delivery_attempts` child table (attempt number, timestamp, HTTP status or error class, latency, truncated response snippet). The `deliveries` row keeps the current state and counters. This is what makes a complaint ("you never called me at 14:02") answerable. Exact schema and partitioning are the DBA's call in a later task.
+
+**SQS DLQ vs. `DEAD` — two different dead-letter concepts, not one.**
+
+`DEAD` is a business state on the `deliveries` row: the *webhook* was attempted and definitively failed (retries exhausted or non-retryable response). It is client-visible, queryable, and replayable via `POST /replay`. It is produced by normal, successful processing of a pointer message — the consumer ran without error and recorded a business failure.
+
+The SQS redrive policy's DLQ is a *transport* safety net for a different failure: the consumer itself cannot process the pointer message — malformed payload, unexpected exception in `AttemptDeliveryUseCase` before it reaches the HTTPS call, or a crash loop on the same message. SQS's `maxReceiveCount` (proposed: 50 — see §10, deliberately high so bulkhead-timeout deferrals, which return the message via `ChangeMessageVisibility` without an attempt, never get miscounted as poison and push a healthy-but-busy delivery into the DLQ) moves such a message off the main queue into `deliveries-dlq` so it stops being redelivered and blocking other messages.
+
+**A message landing in the SQS DLQ does move the `deliveries` row's state — to `FAILED` (§2), not to `DEAD`.** (This corrects an earlier draft of this ADR, which had the DLQ leave the row untouched; `FAILED` was added as its own terminal state specifically so a poison-message row is visible and distinguishable from an ordinary in-flight one, instead of silently looking like normal backlog.) The dedicated DLQ-consumer actor (§2.1) reads the pointer, extracts `delivery_id` where possible, and writes `FAILED`; when the message is too malformed to extract a `delivery_id` at all, no row can be updated and the consumer falls back to logging the raw message content plus a platform-admin alert with no `deliveries` correlation — a residual gap, not fully closed by this design. `FAILED` shares `DEAD`'s public `failed` status (§2) — the client still sees the delivery as failed — but is never accepted by `POST /replay` (§5): it signals an application bug, not something a client-side retry can fix. This is also the trigger for the platform-admin alert (distinct from the client-facing dead-letter rate metric) — an application-bug signal that pages the on-call engineer, not something that appears on the client-facing dashboard. Draining/inspecting the DLQ itself remains a manual operator action (redrive after a fix ships, or discard) and is out of scope for the public API either way.
+
+**Recovering a `FAILED` row, once the underlying bug is fixed, never mutates it.** An internal recovery action (§2.1) — distinct from `POST /replay`, and not exposed on the public API — inserts a new `deliveries` row (`origin = 'RECOVERED'`, `recovered_from = <original FAILED row>`, `PENDING`, `attempt_count = 0`), the same insert-not-mutate shape §5 already uses for `DEAD`. The original `FAILED` row stays untouched as permanent incident audit, and no new state-diagram edge is needed — the new row enters through the same `[*] --> PENDING` arc as any other insert.
+
+**Ordering:** this design does not guarantee per-client ordering of webhook deliveries. Concurrent workers plus independent retry schedules mean a retried event can land after a later event. Ordering was not requested in the case; see Q6.
+
+### 5. Self-service REST API
+
+All three endpoints read the same `deliveries` table (joined to `notification_events` for the event body), through `port/out` interfaces. No separate read model, no projection, no cache in v1 (YAGNI).
+
+| Endpoint | Use case | Behavior |
+| --- | --- | --- |
+| `GET /notification_events?created_from=&created_to=&delivery_status=&cursor=&limit=` | `QueryNotificationEventsUseCase` | Always scoped to the authenticated caller's `client_id`, taken from the security context and never from a request parameter. Filters by event creation date range and public `delivery_status`. Keyset (cursor) pagination on `(created_at, id)` — offset pagination degrades on a write-hot table. **Bounded page size** (proposed: default 50, max 200 — `limit` above the max is clamped, not rejected) and a **default date window** (proposed: last 30 days) applied when `created_from`/`created_to` are omitted, so an unbounded query can never be issued against a write-hot table by accident. Both numbers are proposals, not derived from measured usage — same caveat as Q5/Q7. |
+| `GET /notification_events/{notification_event_id}` | `GetNotificationEventUseCase` | Returns 404, not 403, when the row exists but belongs to another client, so the endpoint does not leak existence of other tenants' ids. Response includes the full attempt history (all `delivery_attempts` rows for this delivery, §9), not just the current `deliveries` row — this is what makes a client's "you never called me at 14:02" complaint answerable from this one endpoint instead of requiring a separate call. |
+| `POST /notification_events/{notification_event_id}/replay` | `ReplayDeliveryUseCase` | Accepted only when the target delivery is in `DEAD` (not `FAILED` — §2, §4). Does **not** mutate the original row. Inserts a **new** `deliveries` row: same `event_id`/`subscription_id`/`client_id`, `status = PENDING`, `attempt_count = 0`, `origin = 'REPLAY'`, `replayed_from = <original row's delivery_id>` (§9). The original `DEAD` row is untouched and stays queryable as-is — permanent audit of the original attempt chain. Returns `409 Conflict` if the target is not `DEAD`, or if a partial-unique constraint (§9) rejects the insert because a non-terminal or already-`DELIVERED` row already exists for this `(event_id, subscription_id)` pair (i.e. a replay is already in flight, or already succeeded). Requires an `Idempotency-Key` header for early HTTP-level rejection of a double click, on top of that DB-level guard. **Returns an acknowledgment that the replay was accepted, not a delivery outcome** — the response carries the new row's id and `status = PENDING`; the actual attempt happens later, asynchronously, through the same relay/worker pipeline as any other delivery (§6.1, §6.2), so there is no outcome to return synchronously. |
+
+Replay deliberately re-enters the pipeline as a fresh `PENDING` row rather than publishing directly to the queue: it reuses one code path (the gateway's own insert shape), and a queue outage cannot lose a replay. Inserting instead of mutating also means the `notification_event_id` a client held before replaying still resolves to the original `DEAD` record with its full history intact; `GET /notification_events/{notification_event_id}/replay`'s response carries the *new* row's id, since that is now the live delivery to poll.
+
+**Port shapes** (contract-level, to be finalized in the feature breakdown):
+
+- `port/in`: `RegisterNotificationEventUseCase`, `DispatchPendingDeliveriesUseCase`, `AttemptDeliveryUseCase`, `QueryNotificationEventsUseCase`, `GetNotificationEventUseCase`, `ReplayDeliveryUseCase` — one method each, taking an immutable command record and returning an immutable result record. `Optional`/empty collections, never `null`.
+- `port/out`: `DeliveryRepositoryPort`, `DeliveryAttemptRepositoryPort`, `SubscriptionRepositoryPort`, `NotificationQueuePort`, `WebhookClientPort`, `ClockPort` (if the domain needs time beyond an injected `Clock`).
+- `domain/model`: `NotificationEvent`, `Delivery`, `DeliveryStatus`, `DeliveryAttempt`, `Subscription`, `RetryPolicy` — plain Java records/enums, zero framework imports.
+
+### 6. Scalability and resiliency argument
+
+- **Horizontal scaling without coordination.** `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` lets N relay/consumer instances claim disjoint batches with no leader election, no Redis lock, no ZooKeeper. This is the whiteboard's "skip lock strategy" and it is the core reason the design scales by adding instances.
+- **Virtual threads are the right concurrency primitive here.** Webhook delivery is almost entirely blocked on remote I/O. Each in-flight delivery is one virtual thread doing a blocking HTTPS call; thousands are cheap, and the platform-thread count stays small. No WebFlux, consistent with the project constraint.
+- **Pinning risk, called out explicitly:** a virtual thread pinned during a blocking call defeats the whole model. The implementation must not hold `synchronized` around the HTTPS call or around JDBC work; use `ReentrantLock` if mutual exclusion is genuinely needed. It must not carry large `ThreadLocal`/`MDC` state across attempts beyond the tracing context. The HTTP client must be a JDK-`HttpClient`-backed `RestClient` (virtual-thread friendly) rather than a legacy client with `synchronized` internals — that choice is a concrete implementation constraint for the backend task.
+- **Bounded blast radius.** Per-attempt timeouts, a bounded claim batch size, and per-subscription `max_concurrency` (§9) together cap how much capacity a single misbehaving client can occupy; the circuit breaker (§9) additionally stops scheduling attempts entirely against a subscription in sustained failure, rather than merely bounding its share.
+- **At-least-once with no loss.** The intent is committed before any attempt; the queue can lose messages and the sweeper re-publishes; a worker can die mid-attempt and the lease expires back to `PENDING`. The only cost is possible duplicate delivery, which the design accepts and mitigates with a delivery-id header.
+- **Backpressure without reactive streams.** The relay claims a bounded batch per poll. If consumers fall behind, rows simply stay `PENDING` and the visible queue depth grows — an observable signal, not a hidden memory buildup.
+- **Failure modes covered:** duplicate ingest (partial unique index, §3, §9), concurrent claim (SKIP LOCKED + state guard in the UPDATE's WHERE clause), crash mid-attempt (relay's own due-query reclaims it, §6.1), queue outage (sweeper — same mechanism as the relay, §6.1), client endpoint down (retry then DEAD), constraint violation on insert (treated as idempotent success), replay of an in-flight delivery (409, §5).
+
+### 6.1 The relay — the guaranteed path
+
+A scheduled job (`fixedDelay`, 5s) is the only mechanism that must work for delivery to happen at all. One query covers three cases at once: orphans the gateway's best-effort SQS publish never reached (§1.1), due retries (§4), and replays the API just created (§5).
+
+```sql
+SELECT d.* FROM deliveries d
+JOIN subscriptions s ON s.subscription_id = d.subscription_id
+WHERE d.status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING')
+  AND d.next_attempt_at <= now()
+  AND (d.status <> 'PENDING' OR d.created_at < now() - interval '30 seconds')
+  AND (d.status <> 'PROCESSING' OR d.updated_at < now() - interval '60 seconds')
+  AND (s.circuit_state <> 'OPEN' OR s.circuit_opened_at < now() - s.circuit_backoff)
+  AND (s.throttled_until IS NULL OR s.throttled_until <= now())
+ORDER BY d.next_attempt_at
+LIMIT 500
+FOR UPDATE SKIP LOCKED
+```
+
+Then, in the same transaction: mark the batch `QUEUED`, push `next_attempt_at` forward by 5 minutes. Commit. Then `SendMessageBatch` (10 per call).
+
+**One addition to the original design of this query: `PROCESSING` is included, with its own staleness guard (`updated_at < now() - 60s`).** Without it, a worker that crashes after claiming a row (`QUEUED -> PROCESSING`) but before writing an outcome leaves that row permanently stuck — the original query only covered `PENDING`/`RETRYING`/`QUEUED`, and §2's state machine promises a `PROCESSING -> PENDING` lease-expiry path that nothing was actually implementing. This closes that gap using the same due-query rather than a separate mechanism: a stale `PROCESSING` row (worker died mid-HTTP-call) is swept back into `QUEUED` and re-published, exactly like a lost message. The 60s threshold is chosen to comfortably exceed the worst normal in-flight time (2s bulkhead acquire + 2s connect + 5s read + DB write, §4, §10) with margin; it's a proposal, not a derived number.
+
+Design points:
+- **`FOR UPDATE SKIP LOCKED` lets relay instances run in parallel without contending:** each takes a disjoint batch. Locks are row-level and live for milliseconds. The alternative — leader election — serializes instead of scaling.
+- **The 30-second grace window on `PENDING`** prevents re-enqueueing a delivery the gateway just sent via its own best-effort publish (§1.1, step 5). On the happy path the row is already `DELIVERED` before it's ever eligible here.
+- **Pushing `next_attempt_at` forward before enqueueing is the recovery mechanism for a lost message:** if nothing processes the row within 5 minutes (or 60s for a stuck `PROCESSING` row), it becomes eligible again on its own, no separate sweeper process needed — this query *is* the sweeper (§0, §6: "relay = guaranteed path").
+- **The `subscriptions` join is the backpressure point.** Deliveries for a client whose circuit is `OPEN` or whose throttle window is active are never enqueued at all (§10). They wait as rows in PostgreSQL instead of as messages cycling through SQS and worker capacity. The cheapest backpressure is not producing the work.
+- **`SendMessageBatch` is partially fallible.** Failed entries stay `QUEUED` and are recovered by the already-pushed clock — no special-case error handling needed for a partial batch failure.
+- **Two independent publish call sites feed the same queue:** the gateway's opportunistic single-message `SendMessage` (§1.1, happy path, low latency) and the relay's batched `SendMessageBatch` (this section, the guarantee). Either can be lost without consequence; only this query's own execution is load-bearing.
+
+**Required index** (supersedes the earlier, narrower version in §9):
+
+```sql
+CREATE INDEX idx_deliveries_due ON deliveries (next_attempt_at)
+  WHERE status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING');
+```
+
+Partial, so `DELIVERED`, `DEAD`, and `FAILED` rows leave the index automatically. The table may hold tens of millions of rows while the index holds only what is outstanding.
+
+### 6.2 Delivery worker
+
+The consumer side of §1's `CONS -> UC3` (`AttemptDeliveryUseCase`). Long-poll (`WaitTimeSeconds = 20`), receive in batches of 10, process each message independently on its own virtual thread. Scaled horizontally by **queue depth** (KEDA on `ApproximateNumberOfMessagesVisible`), not by CPU — the workload is I/O-bound and CPU stays flat while the backlog grows; a CPU-based HPA would never scale this deployment out.
+
+**Per-message flow:**
+
+1. **Conditional claim:** `UPDATE deliveries SET status = 'PROCESSING' WHERE delivery_id = ? AND status = 'QUEUED'`. Narrower than an earlier draft of this flow, which guarded on `status IN ('QUEUED', 'RETRYING', 'PENDING')` — but §2.1 is explicit that only the relay ever writes `PENDING/RETRYING -> QUEUED`, and a pointer message is only ever published after that transition commits (§6.1). There is no legitimate path by which a real SQS message points at a row still `PENDING` or `RETRYING`; guarding on those statuses too would silently let the worker claim a row the relay hasn't dispatched yet. `= 'QUEUED'` is the correct and only expected prior state, consistent with §2.1's own statement of this write.
+2. **Zero rows affected** means another worker already claimed this delivery (duplicate message, SQS at-least-once redelivery, or a relay double-publish, §0). **`DeleteMessage` immediately and stop** — this is the concrete meaning of "the consumer discards the message" in §0's duplicate-enqueue paragraph, stated here explicitly because it matters operationally: if the message were left in the queue instead, it would keep redelivering on every duplicate until `maxReceiveCount` (50, §10) is exhausted and it lands in the DLQ, marking an otherwise-healthy delivery `FAILED` (§2) for no reason other than a benign race. `maxReceiveCount`'s headroom is reserved for bulkhead-timeout deferrals (§10), not for absorbing ordinary duplicate claims — those must be deleted on sight, not left to accumulate receives.
+3. **Bulkhead permit** (§10): acquire the per-subscription semaphore, 2s timeout. On timeout, `ChangeMessageVisibility` (short delay) and stop — no attempt occurred, so no `delivery_attempts` row and no counter changes (§10). The row is exactly as due as before.
+4. **Breaker check** (§10): if the subscription's circuit is `OPEN`, treat identically to a bulkhead timeout — return the message via `ChangeMessageVisibility`, write nothing. In practice this should rarely trigger here, since the relay's due-query already excludes `OPEN`-circuit subscriptions at claim time (§6.1); this is a second, defensive check for the window between the relay's query and this worker's processing.
+5. **Sign and POST** (HMAC over body + timestamp, computed here per the OWASP A02/A04 row — see below) on the virtual thread, with the per-attempt timeouts from §4.
+6. **Insert the `delivery_attempts` row, then update `deliveries`' status** (2xx -> `DELIVERED`; retryable failure -> `RETRYING`; exhausted/non-retryable -> `DEAD`) per §2.1's write table and §4's classification.
+7. **`DeleteMessage`**, last.
+
+**Ordering (steps 6 then 7) is not incidental.** Deleting the SQS message before the attempt/status write commits would lose the attempt record entirely and strand the row in `PROCESSING` with no due-query re-entry until the 60s staleness reclaim (§6.1) — a self-inflicted version of the crash case that reclaim already exists to cover. Committing the DB write first and deleting after means the worst case on a crash between steps 6 and 7 is the message reappearing once `VisibilityTimeout` elapses: harmless, because the conditional claim in step 1 already absorbs it (zero rows affected, delete, done). This is the same asymmetry §0 states generally ("a message lost in SQS is recoverable; a row lost in PostgreSQL is not") applied to this specific ordering decision.
+
+### 8. Observability
+
+Tie into the OTel/Micrometer + `grafana/otel-lgtm` stack already wired in `compose.yaml` and `TestcontainersConfiguration`. No new observability infrastructure.
+
+- **Tracing:** one trace per delivery lifecycle. The ingest span's trace context is persisted on the `deliveries` row (W3C `traceparent`) and restored by the consumer, so ingest -> queue -> attempt -> outcome reads as one trace in Tempo across process boundaries. Spans: `notification.ingest`, `notification.dispatch`, `notification.attempt` (with `http.status_code`, attempt number, outcome). Client-side URL and response body are **not** put on spans.
+- **Metrics (Micrometer -> Mimir):** deliveries by state transition (counter, now including the `-> FAILED` transition separately from `-> DEAD`, §2), attempt outcomes by HTTP status class (counter), attempt latency (timer), outbox depth by state and age of the oldest `PENDING` row (gauges — the single most useful alerting signal), retry count distribution, `DEAD` rate (business, client-facing) tracked separately from `FAILED` rate (internal, admin-facing), replay count (derived from `origin = 'REPLAY'` rows, §9, not a stored counter). Tagged by `event_type` and status class; **not** tagged by `client_id` unless cardinality is checked first (see Q8).
+- **Logging (Loki):** structured, with `delivery_id`, `client_id`, `event_id`, attempt number, and trace id. Webhook response bodies are truncated and secrets/signature headers are never logged (OWASP A09).
+- **Monitoring-team surface:** the dashboard answers "is the pipeline healthy" (oldest pending age, dead rate, p99 attempt latency) and "what happened to client X's event Y" (search by `delivery_id`/`event_id`, pivot to the trace). Suggested alerts: oldest `PENDING` age above threshold, dead-letter rate spike, sustained 5xx rate for a single client, and **any message landing in the SQS DLQ** — this last one pages the platform on-call directly (application-bug signal, distinct from the client-facing dead-rate metric above; see the SQS DLQ vs. `DEAD` distinction in the retry-strategy section).
+
+### 9. Data model
+
+Four tables. `notification_events` and `subscriptions` are inputs; `deliveries` is the outbox and sole source of truth; `delivery_attempts` is its append-only history. Exact SQL/migration/partitioning is the DBA's call in the feature breakdown — this is the contract, not the DDL.
+
+```mermaid
+erDiagram
+  notification_events ||--o{ deliveries : "fans out to"
+  subscriptions ||--o{ deliveries : "targets"
+  deliveries ||--o{ delivery_attempts : "records"
+
+  notification_events {
+    text event_id PK
+    text client_id
+    text event_type
+    text content
+    timestamptz created_at
+  }
+
+  subscriptions {
+    uuid subscription_id PK
+    text client_id
+    text target_url
+    text secret_ref
+    text_array event_types
+    boolean active
+    int max_concurrency
+    text circuit_state
+    timestamptz circuit_opened_at
+    interval circuit_backoff
+    int consecutive_opens
+    timestamptz throttled_until
+    timestamptz created_at
+    timestamptz updated_at
+  }
+
+  deliveries {
+    uuid delivery_id PK
+    text event_id FK
+    uuid subscription_id FK
+    text client_id
+    text status
+    text origin
+    uuid replayed_from FK
+    bigint sequence_number
+    int attempt_count
+    timestamptz next_attempt_at
+    text last_error
+    timestamptz delivered_at
+    text trace_context
+    timestamptz created_at
+    timestamptz updated_at
+  }
+
+  delivery_attempts {
+    bigint id PK
+    uuid delivery_id FK
+    int attempt_number
+    int http_status
+    int response_time_ms
+    text response_excerpt
+    text error
+    timestamptz attempted_at
+  }
+```
+
+**`notification_events`** — immutable, append-only record of what the platform emitted. `event_id` is the platform's id (matches the sample file's `event_id`, e.g. `EVT001`). `created_at` is the event-creation timestamp the API's date-range filter runs against. Never updated after insert.
+
+**`subscriptions`** — the delivery contract with a client, and now also the home of circuit-breaker and throttle state, reused rather than a separate Redis-backed store: the relay already scans `deliveries` and joins `subscriptions` on every claim cycle, so this state is one join away with no extra round trip, no extra moving part, no cache-invalidation problem.
+- `event_types` (array) replaces a `unique(client_id, event_type)` design: one subscription row per client, covering N event types, rather than one row per `(client_id, event_type)` pair. Resolves Q9's shape (subscription CRUD API itself still out of scope for this ADR).
+- `secret_ref` is a reference (secrets-manager key), never the plaintext HMAC secret, per A04 in the OWASP table.
+- `active` lets the gateway's tenant-isolation check reject events for a deactivated subscription without a delete.
+- `max_concurrency` bounds how many `deliveries` rows for this subscription the relay may have claimed (`QUEUED`/`PROCESSING`) at once — the claim query's `WHERE` includes a per-subscription in-flight count check. This is the direct answer to Q7 (previously deferred as YAGNI, now adopted): a slow-but-healthy endpoint can no longer occupy an unbounded share of workers.
+- `circuit_state` (`CLOSED | OPEN | HALF_OPEN`), `circuit_opened_at`, `consecutive_opens` implement a per-subscription circuit breaker, distinct from `max_concurrency` (which bounds parallelism regardless of outcome) and from per-delivery retry (§4, which governs one row's own backoff regardless of the endpoint's overall health). Full mechanics, including why the failure *count* deliberately is **not** a persisted column, are in §10.
+- `throttled_until` is a separate, simpler gate driven by `429`/`Retry-After` (§4): a worker that receives `Retry-After` sets `throttled_until = now() + Retry-After` on the subscription, and the claim query also excludes rows whose subscription is still throttled. This honors a server-requested pause at the subscription level, since a `429` usually reflects the client's overall rate limit, not one delivery's.
+
+**`deliveries`** — the outbox, at most one *live* row per `(event, subscription)` pair at any time (§3), possibly more over time via replay chains (§5), and the only table the self-service API reads from. Column notes:
+- `delivery_id` is the public `notification_event_id` the case's three endpoints operate on. This is a deliberate resolution of a naming tension: the case names the path parameter `notification_event_id`, but the design fans one event out to N deliveries (one per subscription) — so the publicly addressable resource is a *delivery*, not the immutable platform event, even though it is named after the event in the API. Documented here explicitly since it is not obvious from the case text alone; flagged for confirmation alongside Q9.
+- No separate idempotency-key column: a partial unique index on `(event_id, subscription_id)` filtered to non-terminal statuses (§3) gives the guarantee natively — a derived hash column was redundant and has been dropped, and a *hard* unique constraint on the pair was also dropped once replay needed to insert a second row for the same pair after the first went terminal.
+- `origin` (`INGEST | REPLAY | RECOVERED`) and `replayed_from` (nullable, self-referential FK to `deliveries.delivery_id`) record how a row came to exist. `origin = 'INGEST'` for everything the gateway writes; `origin = 'REPLAY'` with `replayed_from` pointing at the original `DEAD` row for anything `POST /replay` writes (§5); `origin = 'RECOVERED'` with `replayed_from` pointing at the original `FAILED` row for the internal (non-public) recovery action (§2.1, §4) — same column reused rather than a separate `recovered_from`, since exactly one of `REPLAY`/`RECOVERED` ever applies per row and `origin` already disambiguates which source row it points at. This is what lets the audit trail chain across both replays and recoveries without ever mutating a terminal row.
+- `sequence_number` is monotonic per `client_id`, assigned at ingest, and carried in the outbound webhook payload so a client can reconstruct delivery order on their side despite the platform giving no ordering guarantee (§0.1, §4).
+- `status` is the enum from the state machine (§2): `PENDING, QUEUED, PROCESSING, RETRYING, DELIVERED, DEAD, FAILED`.
+- `next_attempt_at` drives both the relay/sweeper claim query (§6, "Relay = guaranteed path") and the retry schedule (§4).
+- No explicit `lease_owner`/`lease_expires_at` columns: reclaim of a stale `QUEUED`/`PROCESSING` row (§2, §6.1) is inferred from `status` + `updated_at` + `next_attempt_at` by the relay's own due-query — the same query that does normal dispatch, not a separate lease mechanism. Simpler, one fewer pair of columns; the sketch's unresolved "tobias" label (Q2) is therefore **not** resolved by this table and remains open — still needs the user's confirmation.
+- `circuit_backoff` (on `subscriptions`, not `deliveries`) is the interval written at trip time alongside `circuit_opened_at`, computed as the exponential cooldown (§10) — stored rather than recomputed on every relay poll, since the due-query (§6.1) reads it directly in its `WHERE` clause.
+- `last_error` is a single denormalized field (HTTP status or error class, whichever applies) snapshotting the most recent attempt, so `GET /notification_events` doesn't need to join `delivery_attempts` for its common case; the full history is still in the child table.
+- `delivered_at` is set once, on the `DELIVERED` transition — the terminal-success timestamp, distinct from `updated_at`.
+- `trace_context` persists the W3C `traceparent` (§8) so the consumer can restore the original trace regardless of which process attempts delivery.
+- No `replay_count`/`last_replayed_at`: replay (§5) and recovery (§2.1, §4) don't touch the original row at all, so there is nothing on it to reset or stamp. "How many times has this event been replayed or recovered" is answerable by counting rows with a given `replayed_from` chain, not by a counter column.
+
+Indexes (contract-level, exact definitions belong to the DBA task):
+- `idx_deliveries_due` on `(next_attempt_at)` filtered to `status IN ('PENDING','RETRYING','QUEUED','PROCESSING')` — the relay's due-query, §6.1, is the only consumer of this index; it never scans terminal rows.
+- Partial unique index on `(event_id, subscription_id) WHERE status NOT IN ('DELIVERED', 'DEAD', 'FAILED')` — the idempotency/anti-double-replay guard (§3, §5).
+- Index on `(subscription_id, status)` for the per-subscription in-flight count the bulkhead/`max_concurrency` check needs (§9, §10) — this was missing from the original index list.
+- Index on `replayed_from` for chaining a replay's or recovery's history back to its original.
+- Index on `(client_id, created_at)` for the list endpoint's default ordering and date-range filter, keyset-paginated (§5).
+- Index on `(client_id, status)` for the `delivery_status` filter.
+
+Partitioning: the whiteboard's date-partitioning note is honored by range-partitioning `deliveries` (and `delivery_attempts`) on `created_at`, monthly. Terminal rows (`DELIVERED`, `DEAD`) older than a retention window are archived/dropped by partition, not by row-level delete — the DBA task owns the exact retention period.
+
+**`delivery_attempts`** — append-only, one row per HTTP attempt (or per attempted-but-failed-before-HTTP case, e.g. URL revalidation failure). No separate `outcome` enum column: success/retryable/non-retryable is derived from `http_status`/`error` using the same classification as §4 (including the 3xx / 408 / 429 nuances), not stored redundantly. `response_excerpt` is truncated and never contains signature headers or secrets (A09). This table is what makes a client complaint ("you never called me at 14:02") answerable with a query instead of a guess, and it is what the SQS-DLQ observer (if built, per the earlier DLQ analysis) would correlate against via `delivery_id` when raising an admin alert — the DLQ message itself carries no delivery history, only the pointer. Kept separate rather than collapsed into a JSONB column on `deliveries` because the monitoring requirement is answered with queries over it: p95 endpoint latency per client, failure rate over a window, full history behind a single complaint.
+
+### 10. Resilience policies
+
+Three distinct mechanisms, deliberately not merged into one:
+
+| Mechanism | Granularity | Lives in | Triggered by |
+| --- | --- | --- | --- |
+| Exponential backoff + jitter | per delivery | `deliveries.next_attempt_at` | any retryable failure |
+| Circuit breaker | per subscription | `subscriptions` (PostgreSQL) | consecutive failures |
+| Bulkhead (concurrency limit) | per subscription | in-process semaphore | always active |
+| Throttle | per subscription | `subscriptions.throttled_until` | HTTP 429 |
+
+**Backoff** (§4): `5s -> 30s -> 2m -> 10m -> 1h -> 6h`, ±20% jitter. Jitter is mandatory: without it, ten thousand deliveries that failed together retry in the same instant and keep the client's endpoint down.
+
+**Circuit breaker: state in PostgreSQL, not Redis.** `circuit_state` must be shared across replicas — if each pod learned independently, a dead client would take up to N x the unnecessary traffic before any pod stopped sending to it, N being the replica count. PostgreSQL was chosen over Redis because the relay already reads `subscriptions` every claim cycle (§1, §6): the open-circuit filter is one extra column in a join it already does, not a new piece of infrastructure to run, monitor, and fail over.
+
+To avoid turning `subscriptions` into a hot row, **only the state transition is written**, not a failure counter:
+- The trip decision itself is made from an **in-memory** per-subscription failure count, held in each pod (one `Resilience4j CircuitBreaker` instance per `subscription_id`, per pod) — this is what `consecutive_failures` would have been as a column, and deliberately is not one, since writing it on every attempt is exactly the hot-row pattern being avoided.
+- When a pod's local breaker trips, it issues one conditional write: `UPDATE subscriptions SET circuit_state = 'OPEN', circuit_opened_at = now(), circuit_backoff = <computed>, consecutive_opens = consecutive_opens + 1 WHERE subscription_id = ? AND circuit_state = 'CLOSED'` — first writer wins; a second pod tripping moments later affects zero rows and does nothing further. `<computed>` is the exponential cooldown (below), evaluated once at trip time and stored in `circuit_backoff` (§9) so the relay's due-query (§6.1) can read it directly rather than recomputing it on every poll.
+- This means the **pre-trip** window is genuinely per-pod (each pod's local count is independent, so in the worst case a dead client absorbs traffic from every pod at once until the first one trips), but the **post-trip** state is immediately global: once `circuit_state = 'OPEN'` lands in PostgreSQL, every pod's relay excludes that subscription on its very next claim cycle (§6.1's due-query), regardless of which pod's local breaker was the one that tripped. The N x traffic exposure is bounded to that one pre-trip window, not sustained.
+- `consecutive_opens` is the one counter that *is* persisted, because it must survive restarts and be shared to compute an escalating cooldown (§9) — a pod restarting should not reset a chronically dead client back to a short cooldown. `circuit_backoff = base_cooldown * 2 ^ (consecutive_opens - 1)`, capped, computed once at trip time and stored (proposal, not a derived number — same caveat as Q5/Q7).
+- **Open point, not yet resolved:** nothing in this section (or anywhere else in the ADR) currently writes `circuit_state` back to `HALF_OPEN` or `CLOSED` — the only transition defined is `CLOSED -> OPEN`. As written, a circuit that trips never recovers. This is a known gap, called out for a dedicated pass rather than patched inline here.
+- Redis would be justified by a genuine need for a true sliding-window failure rate or an exact global concurrency count; neither is required here — the design tolerates the bounded, temporary over-count above.
+
+**Bulkhead: a permit set per subscription, sized by `max_concurrency`** (default 10), implemented with Resilience4j so retry, breaker, and bulkhead compose as decorators around one call rather than as hand-rolled acquire/release bookkeeping scattered through `AttemptDeliveryUseCase`.
+- Acquisition uses a short timeout (2s). On acquisition failure, the message is returned to SQS with `ChangeMessageVisibility` (a short delay, not a full requeue) and **no state is written** — no attempt occurred, so `attempt_count` must not move and no `delivery_attempts` row is created. The row is exactly as due for an attempt as it was before.
+- `maxReceiveCount` is set high (proposed: 50, see §4's DLQ note) precisely so these bulkhead-timeout deferrals — which are expected, routine, and not failures — never accumulate enough receives to misclassify a healthy-but-busy delivery as a poison message and push it into the DLQ.
+
+**Breaker vs. bulkhead — different problems, not redundant:**
+- The **bulkhead is preventive** and applies to a healthy-but-slow client: without it, virtual threads happily open thousands of concurrent connections against an endpoint sized for fifty, and this service becomes the cause of the very outage the breaker exists to detect.
+- The **breaker is reactive** and applies once a client is already failing: it stops sending work at all, rather than merely bounding how much is in flight.
+- Composition order per call: bulkhead permit first (bounds concurrency even while `CLOSED`), then breaker check (skip entirely if `OPEN` — enforced earlier too, at the relay's claim query, so a `PROCESSING`-bound attempt should rarely even reach this layer), then the retry-classified HTTPS attempt itself.
+
+## Consequences
+
+**Becomes easier**
+- All three API endpoints are straightforward reads/writes against one authoritative table; no cross-store reconciliation.
+- Delivery history and replay are first-class data, so client complaints are answerable with a query.
+- Adding consumer capacity is adding instances; no coordination change.
+- The queue is swappable (SQS -> Kafka -> Postgres `LISTEN/NOTIFY` -> plain polling) by replacing one `port/out` adapter; the design degrades to pure DB polling if the queue is removed entirely.
+- The domain (state machine, retry policy, tenant check) is framework-free and unit-testable with no Spring context.
+
+**Becomes harder / debt created**
+- Three moving parts (gateway, relay — which is also the sweeper, §6.1, not a separate process — and consumer) instead of one; more to reason about for a single developer.
+- `deliveries` is write-hot: needs a partial index on `(status, next_attempt_at)` for the claim query, a retention/partitioning plan (the whiteboard's date-partitioning note), and archival of terminal rows. Owned by the DBA in a later task.
+- Claim polling adds steady baseline DB load; cadence and batch size need tuning.
+- At-least-once puts a deduplication obligation on clients; this must be in the public webhook documentation.
+- No per-client ordering guarantee; if a client later needs it, that is a new ADR.
+
+**Blocks / unblocks**
+- Unblocks: the schema + migration ADR/task (DBA), the Spring Security and SSRF-defense design (security-engineer), and the outbound webhook signing scheme.
+- Blocks nothing already accepted; this is ADR-001.
+- Follow-up ADRs likely needed for: webhook payload signing (HMAC vs. mTLS), subscription management API (out of scope here), and outbox retention/partitioning if volume warrants it.
+
+## OWASP / Security Impact
+
+This feature is a publicly exposed API that also makes outbound calls to client-supplied URLs, so it touches several categories. **Named here, not designed here** — full mitigation design is deferred to a `security-engineer` (Sentinel) task in the feature breakdown once this ADR is Accepted.
+
+| OWASP Top 10:2025 | Exposure in this design | Mitigation direction (one line) |
+| --- | --- | --- |
+| **A01 Broken Access Control (incl. SSRF)** — IDOR | `GET /notification_events/{id}` and `POST .../replay` take a client-controlled id; a missing per-resource tenant check leaks or replays another client's notification. | Every query filters by the authenticated `client_id` from the security context, enforced in the use case and in the SQL `WHERE`, never from a request parameter; return 404 rather than 403 on a foreign id. |
+| **A01 Broken Access Control — SSRF** | The webhook URL is client-supplied and the service calls it from inside the platform network — the textbook SSRF vector (cloud metadata endpoints, internal services, `localhost`). | Validate the URL at subscription time and re-validate at attempt time: HTTPS only, public DNS resolution only, deny RFC1918/loopback/link-local/metadata ranges, deny redirects to them, resolve-then-pin to defeat DNS rebinding, and route egress through a controlled path. |
+| **A05 Injection** | Filter parameters (`delivery_status`, date range, cursor) and `client_id` reach SQL; `content` reaches an outbound HTTP body. | `NamedParameterJdbcTemplate` bound parameters only, no string-concatenated SQL; `delivery_status` bound to an enum at the adapter boundary via Bean Validation, never passed through as free text. |
+| **A07 Authentication Failures** | A public self-service API; weak or absent authn exposes every tenant's notification history. | Spring Security on every endpoint, no permit-all; per-client credentials/token with rate limiting on the replay endpoint in particular. |
+| **A09 Logging & Alerting Failures** | The monitoring requirement is explicitly part of the case; logs will carry client ids, URLs, and webhook responses. | Structured logs with trace correlation; never log signature headers, credentials, or full client response bodies; alert on oldest-pending age and dead-rate, not just on errors. |
+| **A10 Mishandling of Exceptional Conditions** | The retry/dead classification decides whether an error path fails open (keeps hammering a client) or closed (silently drops a notification). | The state machine has no path that discards a delivery without a terminal state; ambiguous failures default to `RETRYING` (fail safe, bounded), and exhaustion is explicit and visible. |
+| **A02 Security Misconfiguration** / **A04 Cryptographic Failures** | Outbound TLS verification and webhook payload signing. | Enforce TLS certificate validation (never disable it for "difficult" clients); sign payloads (HMAC over body + timestamp) so clients can verify origin — signing scheme is its own follow-up decision. HMAC location: computed in `AttemptDeliveryUseCase` (domain-adjacent, framework-free — a pure function of body + timestamp + per-subscription secret), immediately before the call reaches `WebhookClientPort`, never in the adapter. The secret lives on the `subscriptions` row (or a secrets manager reference, not the plaintext, per the DBA task), is loaded once per attempt, and is never logged or included in `delivery_attempts`. The resulting signature is sent as a request header (e.g. `X-Cobre-Signature`) alongside the timestamp; it is not persisted on the `deliveries`/`delivery_attempts` rows, since it is a function of already-persisted data and can be recomputed if needed. |
+| **A03 Software Supply Chain Failures** | This design introduces at least one new dependency (an AWS SQS SDK or equivalent queue client). | Pin versions, run dependency scanning in the build; flagged for the devops-engineer/security-engineer tasks. |
+
+## Assumptions and Open Questions
+
+Items the user should confirm or correct before setting `Status: Accepted`. Nothing below was silently guessed — each is an explicit interpretation.
+
+- **Q1 — Queue technology (assumption).** The whiteboard says "SQS", so this ADR assumes AWS SQS with long polling and a DLQ. No infrastructure provider is pinned in `CLAUDE.md` or `compose.yaml`, so this is an assumption, not a fact about the project. Confirm SQS, or name the alternative. Note the design tolerates the queue being removed entirely (relay polling alone still works), so this is a low-risk assumption.
+- **Q2 — "tobias" column on the whiteboard (unresolved).** The `deliveries` table sketch contains a label read as "tobias" that could not be interpreted. Best interpretation: it is a column name or abbreviation, possibly shorthand for a timestamp/TTL or an owner/lease field. **Not incorporated into this ADR.** Please confirm what it was meant to be; if it is a real column it needs to land in the schema task.
+- **Q3 — "check nonce" in the consumer (interpretation).** Interpreted as the consumer-side idempotency check: re-verify, before attempting, that the claimed row is still in an attemptable state and has not already been delivered by another worker — implemented as a state guard in the claiming `UPDATE ... WHERE status = ?` rather than a cryptographic nonce. If "nonce" instead meant a per-request nonce sent **to** the client for replay protection on their side, that is a different (and also reasonable) feature and should be stated, since it changes the outbound payload contract.
+- **Q4 — Public status vocabulary (assumption).** The sample data only shows `completed` and `failed`. This ADR assumes the API may also return `pending` for deliveries still in flight, since a list endpoint that hides in-flight deliveries would be misleading. Confirm whether the graders' expected contract is strictly the two-value enum.
+- **Q5 — Retry numbers (proposal, not derived).** 6 attempts, 30s base, 2x multiplier, 1h cap, 2s connect / 5s read timeouts are reasonable defaults but are **not** derived from any measured data. Confirm or replace with real SLO numbers.
+- **Q6 — Per-client ordering (assumption: not required).** The case does not ask for ordered delivery, and this design does not provide it. If clients must receive events in platform order, the design needs per-client serialization (FIFO queue group or a per-client lock) and this ADR should be revised before acceptance.
+- **Q7 — Per-subscription concurrency cap and circuit breaker (adopted, no longer deferred).** `subscriptions.max_concurrency`, `circuit_state`, `circuit_opened_at`, `consecutive_opens`, and `throttled_until` (§9, §10) resolve this: a slow endpoint is bounded by `max_concurrency`, a sustained-failing one is stopped from being scheduled at all while its circuit is `OPEN`. Confirm the proposed trip threshold (Resilience4j, in-memory, per pod — proposed: 10 consecutive failures, §10) and cooldown shape (exponential, base doubling per `consecutive_opens`) — both are proposals, not derived numbers, same caveat as Q5's retry schedule.
+- **Q8 — `client_id` as a metric tag (open).** Per-client metrics are what the monitoring team actually wants, but `client_id` is unbounded-cardinality for a time-series store. Proposal: per-client detail lives in logs and traces (queryable), while metrics stay tagged by `event_type` and status class only. Confirm, or accept the cardinality cost.
+- **Q9 — Subscription management is out of scope (assumption).** This ADR consumes a `subscriptions` table (client, event type, URL, secret, active flag) but does not design its CRUD API. The three endpoints in the case are the only public surface assumed. Confirm.
+- **Q10 — Event ingress mechanism (resolved).** Synchronous HTTP endpoint, not a queue listener — pinned in §1.1. The gateway validates, resolves subscriptions, writes `notification_events`/`deliveries` in one transaction, and responds `202` before ever touching SQS. Still confirm the producer-authentication mechanism for this endpoint (platform-internal credential, separate from the self-service API's client auth) — not specified.
+- **Q11 — Deployment topology (assumption).** Relay, sweeper, consumer and API are assumed to run as beans in one Spring Boot application (single developer, single module), scaled as identical instances. Confirm, or state that they should be separable deployables.
+- **Q12 — No reactivation path for an auto-deactivated subscription (resolved: deactivate; open: how to undo).** §4's response classification deactivates the subscription (`active = false`) on both `404` and `410`, confirmed by the user. Since subscription management is explicitly out of scope (Q9), there is currently no endpoint in this design that flips `active` back to `true` — a client whose endpoint returned a transient `404` (deploy blip, momentary misroute) stays deactivated until a human operator intervenes directly on the row. Confirm this is acceptable for v1, or note that subscription reactivation needs to be pulled into scope (even as a minimal admin-only endpoint) rather than deferred entirely.
+
+## Downstream
+
+Once Accepted, the feature/task breakdown for this ADR lives at `docs/features/FEAT-001-webhook-notification-delivery/`.
