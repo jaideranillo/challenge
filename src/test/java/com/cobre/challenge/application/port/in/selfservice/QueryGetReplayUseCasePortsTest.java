@@ -55,7 +55,8 @@ class QueryGetReplayUseCasePortsTest {
         Delivery delivery = new Delivery(
                 UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
                 DeliveryStatus.DELIVERED, DeliveryOrigin.INGEST, Optional.empty(),
-                1, Optional.empty(), Optional.empty(), Optional.of(Instant.now()));
+                1, Optional.empty(), Optional.empty(), Optional.of(Instant.now()),
+                Instant.now(), Optional.empty());
         NotificationEvent event = new NotificationEvent(
                 "EVT001", "client-1", "payment.created", "{}", Instant.now());
 

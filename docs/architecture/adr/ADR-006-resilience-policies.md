@@ -84,12 +84,14 @@ stateDiagram-v2
   HALF_OPEN --> OPEN: probe returns a breaker-counting failure<br/>writer: worker (ADR-002 §2.2 step 6)
 ```
 
-| Transition | Who writes it | Conditional `UPDATE subscriptions SET ... WHERE subscription_id = ? AND ...` |
-| --- | --- | --- |
-| `CLOSED -> OPEN` | worker, when its pod-local breaker trips | `circuit_state = 'OPEN', circuit_opened_at = now(), circuit_backoff = base * 2^consecutive_opens, consecutive_opens = consecutive_opens + 1` ... `AND circuit_state = 'CLOSED'` |
-| `OPEN -> HALF_OPEN` | relay, on the poll cycle where the cooldown has elapsed | `circuit_state = 'HALF_OPEN'` ... `AND circuit_state = 'OPEN' AND circuit_opened_at < now() - circuit_backoff` |
-| `HALF_OPEN -> CLOSED` | worker, in the probe's outcome transaction | `circuit_state = 'CLOSED', circuit_opened_at = NULL, circuit_backoff = NULL, consecutive_opens = 0` ... `AND circuit_state = 'HALF_OPEN'` |
-| `HALF_OPEN -> OPEN` | worker, in the probe's outcome transaction | `circuit_state = 'OPEN', circuit_opened_at = now(), circuit_backoff = base * 2^consecutive_opens, consecutive_opens = consecutive_opens + 1` ... `AND circuit_state = 'HALF_OPEN'` |
+| Transition | Operation (Amendment B1) | Who writes it | Conditional `UPDATE subscriptions SET ... WHERE subscription_id = ? AND ...` |
+| --- | --- | --- | --- |
+| `CLOSED -> OPEN` | `tripCircuit` | worker, when its pod-local breaker trips | `circuit_state = 'OPEN', circuit_opened_at = now(), circuit_backoff = base * 2^consecutive_opens, consecutive_opens = consecutive_opens + 1` ... `AND circuit_state = 'CLOSED'` |
+| `OPEN -> HALF_OPEN` | `promoteToHalfOpen` | relay, on the poll cycle where the cooldown has elapsed | `circuit_state = 'HALF_OPEN'` ... `AND circuit_state = 'OPEN' AND circuit_opened_at < now() - circuit_backoff` |
+| `HALF_OPEN -> CLOSED` | `closeCircuit` | worker, in the probe's outcome transaction | `circuit_state = 'CLOSED', circuit_opened_at = NULL, circuit_backoff = NULL, consecutive_opens = 0` ... `AND circuit_state = 'HALF_OPEN'` |
+| `HALF_OPEN -> OPEN` | `reopenCircuit` | worker, in the probe's outcome transaction | `circuit_state = 'OPEN', circuit_opened_at = now(), circuit_backoff = base * 2^consecutive_opens, consecutive_opens = consecutive_opens + 1` ... `AND circuit_state = 'HALF_OPEN'` |
+
+> **Amendment B1 (2026-09-20, Tech Lead directive).** These four transitions are now four separately named port operations, replacing the single generic `transitionCircuitState(subscriptionId, expected, target, now)` the FEAT-003 contract exposed. That signature could write `circuit_state` and nothing else, so `circuit_opened_at`, `circuit_backoff` and `consecutive_opens` — every companion column the table above requires — were inexpressible. See `## Amendments` at the end of this ADR, which also states why `tripCircuit` and `reopenCircuit` are two operations and not one.
 
 Design points behind those four rows:
 
@@ -129,6 +131,34 @@ Carried from the master Q-list in `docs/architecture-overview.md`; this one is o
 
 - **Q7 — Per-subscription concurrency cap and circuit breaker (resolved; two numbers unvalidated).** Adopted, no longer deferred. `subscriptions.max_concurrency`, `circuit_state`, `circuit_opened_at`, `circuit_backoff`, `consecutive_opens` and `throttled_until` (ADR-003 §3, §1.2, §1.3) resolve this: a slow endpoint is bounded by `max_concurrency`, a sustained-failing one is not scheduled at all while its circuit is `OPEN`, and the circuit now has a complete recovery path (`OPEN -> HALF_OPEN -> CLOSED`, with `HALF_OPEN -> OPEN` on a failed probe, §1.2). The one remaining open detail is numeric, same caveat class as ADR-004's Q5: the trip threshold (Resilience4j, in-memory, per pod — proposed: **10 consecutive breaker-counting failures**, ADR-004 §1's classification column) and the cooldown shape (`circuit_backoff = base * 2^consecutive_opens`, capped, reset on close). Both are proposals, not derived numbers, and both are configuration rather than contract.
 
+## Amendments
+
+Post-acceptance correction to this ADR's contract-level text, made on **Tech Lead directive of 2026-09-20** while reviewing the FEAT-004 persistence-adapter plan. Recorded in place rather than as a new ADR: it reverses no decision, it names operations §1.2 already specified as SQL and adds the columns §1.2 already required. `Status` is unchanged and is not an agent's to change.
+
+### B1. Four named circuit operations replace the generic `transitionCircuitState`
+
+`SubscriptionRepositoryPort` exposed `transitionCircuitState(UUID, CircuitState expected, CircuitState target, Instant now)`, which could write `circuit_state` and `updated_at` only. §1.2's table requires `circuit_opened_at`, `circuit_backoff` and `consecutive_opens` to move in the **same statement** as a trip, and none of them fits that signature. The gap was logged in `docs/concerns.md` during the FEAT-004 breakdown and is closed here.
+
+The four operations are named in §1.2's table above. Each remains one conditional, first-writer-wins `UPDATE`, at most once per state change, never once per delivery, returning whether exactly one row was affected.
+
+### B2. `tripCircuit` and `reopenCircuit` are two operations, not one with a parameter
+
+They write an identical `SET` clause and differ **only** in their guard, and that difference is the whole point:
+
+| | `tripCircuit` | `reopenCircuit` |
+| --- | --- | --- |
+| Guard | `AND circuit_state = 'CLOSED'` | `AND circuit_state = 'HALF_OPEN'` |
+| Means | a healthy destination has started failing | a probe against a recovering destination failed again |
+| Caller | worker, pod-local breaker trip | worker, in the probe's outcome transaction (§1.2, ADR-002 §2.2 step 6) |
+
+Collapsing them into one operation that takes the expected state as an argument is exactly the generic shape B1 removes, and it would let a caller pass the wrong precondition. Keeping them separate makes the two preconditions unforgeable at the call site: a failed probe **depends** on the `HALF_OPEN` guard, because a probe outcome applied to a `CLOSED` circuit would trip a destination that nothing is currently failing against, and a trip applied to a `HALF_OPEN` circuit would double-count a cooldown escalation. Both names appear in §1.2's table so the mapping is unambiguous.
+
+`promoteToHalfOpen` likewise keeps §1.2's compound guard (`circuit_state = 'OPEN' AND circuit_opened_at < :as_of - circuit_backoff`), so the cooldown check is part of the atomic update rather than a read-then-write race, and takes the relay's `asOf` instant so one poll cycle evaluates against one clock.
+
+### B3. The cooldown exponent uses the pre-update `consecutive_opens`
+
+§1.2's prose says `circuit_backoff = base_cooldown * 2 ^ (consecutive_opens - 1)` while its table's SQL says `base * 2^consecutive_opens` in a statement that also does `consecutive_opens = consecutive_opens + 1`. **These agree and neither is a typo**, because a PostgreSQL `UPDATE`'s right-hand side reads the pre-update value: on a first trip the column is `0`, so `base * 2^0 = base`, and the prose's post-update reading (`1 - 1 = 0`) gives the same. Stated explicitly because writing `2^(consecutive_opens + 1)` in the adapter would silently double every cooldown, and that is not the kind of bug a test notices unless it is looking for it. The cap from §1.2 ("capped") is applied in the same expression.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments B1-B3 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.

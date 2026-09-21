@@ -297,6 +297,8 @@ and the resolver, not the handler, is what consults the security context. A deve
 
 **The internal pipeline ports stay separate.** `SubscriptionRepositoryPort`, the relay's claim query and the worker's outcome writes are cross-tenant by design (ADR-002 sections 2.1, 2.2) and take no `TenantId`. They are separate interfaces from the client-facing ones, which is Interface Segregation doing real work here: the split is not stylistic, it is the boundary between "acts for one tenant" and "acts for the platform", and it is visible in the type system.
 
+> **Amendment E1 (2026-09-20, Tech Lead directive).** This requirement is now actually applied to the delivery port, which the first FEAT-003 pass left as one interface spanning both sides. `DeliveryRepositoryPort` is split into `DeliveryPipelineRepositoryPort` (cross-tenant) and `DeliveryQueryRepositoryPort` (tenant mandatory on every method). See `## Amendments` at the end of this ADR, which also states why the pipeline port carries an unscoped `findById` and why that does not weaken the paragraph below.
+
 #### 5.3 Layer 3 - the tenant is bound into the SQL, and into the database session
 
 The JDBC adapter binds the `TenantId` as a named parameter in the `WHERE` clause of every tenant-scoped query (`AND client_id = :client_id`), always bound, never concatenated (A05).
@@ -448,8 +450,30 @@ Stated explicitly so the boundaries are not inferred:
 | **A09 Logging & Alerting Failures** | Authentication failures, authorization denials, and rate-limit rejections are logged structurally with `client_id`, `sub`, trace id and outcome. **The bearer token, its signature, and any key material are never logged**, at any level, consistent with ADR-002's A09 row on signature headers. Worth alerting on: a sustained 401 rate from one source, any 403 on the replay scope (a client attempting an operation it was never granted is a signal), and rate-limit exhaustion by client. |
 | **A10 Mishandling of Exceptional Conditions** | Every error path in this design fails closed. An unset tenant session variable matches zero rows rather than all rows. An unreachable JWKS produces 401s rather than a fallback to a weaker key. A misconfigured key or issuer prevents startup rather than degrading silently. An unmatched path is denied rather than defaulting to the last chain's rules. |
 
+## Amendments
+
+Post-acceptance correction, made on **Tech Lead directive of 2026-09-20** while reviewing the FEAT-004 persistence-adapter plan. It strengthens section 5.2 rather than relaxing it. `Status` is unchanged and is not an agent's to change.
+
+### E1. The delivery port is split, and the pipeline half carries an unscoped `findById`
+
+Section 5.2's interface-segregation requirement is now applied to the delivery port (it was not, in the first FEAT-003 pass, which is why it was logged in `docs/concerns.md`):
+
+| Port | Tenant | Methods |
+| --- | --- | --- |
+| `DeliveryQueryRepositoryPort` | **mandatory on every method** | `findById(deliveryId, clientId)`, `findPage(clientId, ...)` |
+| `DeliveryPipelineRepositoryPort` | none, cross-tenant by design | `insert`, `findById(deliveryId)`, `claimForProcessing`, `markDelivered`, `scheduleRetry`, `markDead`, `markFailed`, `deferDelivery`, `claimDue` |
+
+**Section 5.2's "There is no `findById(DeliveryId)`" still holds, unweakened, on the port it was written about.** `DeliveryQueryRepositoryPort` has no unscoped overload, so a client-facing use case still has nothing to call. What changes is that the pipeline's own row load is now expressible on the pipeline port, where section 5.2's existing carve-out already put it: internal pipeline ports "are cross-tenant by design and take no `TenantId`". ADR-002 section 2.2 requires that read (the worker needs `event_id`, `subscription_id`, the authoritative `attempt_count` and `trace_context` for the row it just claimed) and the worker has no principal, so the alternative to naming it was a pipeline that could not be built.
+
+This is the argument the split has to earn, so it is stated plainly: **before the split, adding an unscoped `findById` would have put a tenant-less read on the same interface a client-facing use case injects, which is exactly the hole section 5.2 exists to close.** After the split it cannot, because the two are different types and a query use case never sees the pipeline one. The type system now carries the distinction that was previously a comment, which is a net gain for section 5.2's own premise that "a rule that depends on a developer remembering it is not a control".
+
+Two consequences for the deferred ADR-007 implementation feature, so they are not lost:
+
+- When `TenantId` (section 5.1) lands, it applies to `DeliveryQueryRepositoryPort`'s two methods only. `DeliveryPipelineRepositoryPort` takes no `TenantId`, by design, and an ArchUnit rule asserting "every port method takes a `TenantId`" would be wrong; the rule must be scoped to the client-facing ports.
+- When RLS (section 5.4) lands, `DeliveryPipelineRepositoryPort`'s adapter runs under `challenge_pipeline` and `DeliveryQueryRepositoryPort`'s under `challenge_api`. The split makes that wiring a per-adapter decision made once, rather than a per-method one, and it makes the "API path accidentally wired to the pipeline pool" failure this ADR's Consequences section warns about visible as a constructor argument.
+
 ## Downstream
 
-Once **this ADR and ADR-001 through ADR-006 are all Accepted**, the feature/task breakdown for this ADR lives at `docs/features/FEAT-002-api-security-and-tenant-isolation/`.
+Once **this ADR and ADR-001 through ADR-006 are all Accepted**, the feature/task breakdown for this ADR lives at `docs/features/FEAT-002-api-security-and-tenant-isolation/`. Amendment E1 above is delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`; the rest of this ADR still awaits its own breakdown, which needs a free FEAT number (FEAT-002 is taken).
 
 Anticipated task split, for sizing only, not a commitment before approval: the `TenantId` type and its resolver; the filter chain configuration and the startup validator; the JWT decoder, validators and authority mapper; the RLS migration and the two-role setup (DBA); the tenant-scoped port signature changes and their adapters; the rate-limit filter; the ArchUnit rules; the dev-key tooling and per-environment configuration (devops); and an end-to-end cross-tenant isolation test run through the non-bypassing database role.

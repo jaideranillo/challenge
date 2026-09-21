@@ -107,12 +107,16 @@ class DeliveryDueQueryIndexTest {
                         + "VALUES (?, ?, 'payment.completed', 'test-content', now() - interval '5 minutes')",
                 eventBatch);
 
+        // event_created_at is NOT NULL (V4 migration); use the same age as created_at
+        // so the planner sees realistic statistics. The due-query index test only
+        // checks idx_deliveries_due usage, not the event_created_at value.
         jdbcTemplate.batchUpdate(
                 "INSERT INTO deliveries (delivery_id, event_id, subscription_id, client_id, status, "
-                        + "next_attempt_at, created_at, updated_at) "
+                        + "next_attempt_at, created_at, updated_at, event_created_at) "
                         + "VALUES (?, ?, ?, ?, ?::delivery_status, "
                         + "CASE WHEN ? THEN now() - interval '60 seconds' ELSE NULL END, "
-                        + "now() - interval '5 minutes', now() - interval '5 minutes')",
+                        + "now() - interval '5 minutes', now() - interval '5 minutes', "
+                        + "now() - interval '5 minutes')",
                 deliveryBatch);
 
         jdbcTemplate.execute("ANALYZE deliveries");

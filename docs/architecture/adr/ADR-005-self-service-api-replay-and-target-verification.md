@@ -26,7 +26,7 @@ All three endpoints read the same `deliveries` table (joined to `notification_ev
 
 | Endpoint | Use case | Behavior |
 | --- | --- | --- |
-| `GET /notification_events?created_from=&created_to=&delivery_status=&cursor=&limit=` | `QueryNotificationEventsUseCase` | Always scoped to the authenticated caller's `client_id`, taken from the security context and never from a request parameter. Filters by event creation date range and public `delivery_status`. Keyset (cursor) pagination on `(created_at, id)` — offset pagination degrades on a write-hot table. **Bounded page size** (proposed: default 50, max 200 — `limit` above the max is clamped, not rejected) and a **default date window** (proposed: last 30 days) applied when `created_from`/`created_to` are omitted, so an unbounded query can never be issued against a write-hot table by accident. Both numbers are proposals, not derived from measured usage — same caveat as ADR-004's Q5 and ADR-006's Q7. |
+| `GET /notification_events?created_from=&created_to=&delivery_status=&cursor=&limit=` | `QueryNotificationEventsUseCase` | Always scoped to the authenticated caller's `client_id`, taken from the security context and never from a request parameter. Filters by event creation date range and public `delivery_status`. Keyset (cursor) pagination on `(created_at, id)` — offset pagination degrades on a write-hot table. **Amendment D2 (2026-09-20): the date filter and the keyset both key on `deliveries.event_created_at`**, the denormalized copy of the event's own timestamp (ADR-003 Amendment A4), so the keyset tuple is `(event_created_at, delivery_id)`. This is what "event creation date range" in this row has always meant, and it is not `deliveries.created_at`: for a replayed row those differ, and the delivery row's own `created_at` is when the replay was requested. **Bounded page size** (proposed: default 50, max 200 — `limit` above the max is clamped, not rejected) and a **default date window** (proposed: last 30 days) applied when `created_from`/`created_to` are omitted, so an unbounded query can never be issued against a write-hot table by accident. Both numbers are proposals, not derived from measured usage — same caveat as ADR-004's Q5 and ADR-006's Q7. |
 | `GET /notification_events/{notification_event_id}` | `GetNotificationEventUseCase` | Returns 404, not 403, when the row exists but belongs to another client, so the endpoint does not leak existence of other tenants' ids. Response includes the full attempt history (all `delivery_attempts` rows for this delivery, ADR-003 §3), not just the current `deliveries` row — this is what makes a client's "you never called me at 14:02" complaint answerable from this one endpoint instead of requiring a separate call. |
 | `POST /notification_events/{notification_event_id}/replay` | `ReplayDeliveryUseCase` | Accepted only when the target delivery is in `DEAD` (not `FAILED` — ADR-003 §1, ADR-004 §1). Does **not** mutate the original row. Inserts a **new** `deliveries` row: same `event_id`/`subscription_id`/`client_id`, `status = PENDING`, `attempt_count = 0`, `origin = 'REPLAY'`, `replayed_from = <original row's delivery_id>` (ADR-003 §3). The original `DEAD` row is untouched and stays queryable as-is — permanent audit of the original attempt chain. Returns `409 Conflict` if the target is not `DEAD`, or if a partial-unique constraint (ADR-003 §3) rejects the insert because a non-terminal or already-`DELIVERED` row already exists for this `(event_id, subscription_id)` pair (i.e. a replay is already in flight, or already succeeded). Requires an `Idempotency-Key` header for early HTTP-level rejection of a double click, on top of that DB-level guard. **Returns an acknowledgment that the replay was accepted, not a delivery outcome** — the response carries the new row's id and `status = PENDING`; the actual attempt happens later, asynchronously, through the same relay/worker pipeline as any other delivery (ADR-002 §2.1, ADR-002 §2.2), so there is no outcome to return synchronously. |
 
@@ -35,7 +35,7 @@ Replay deliberately re-enters the pipeline as a fresh `PENDING` row rather than 
 **Port shapes** (contract-level, to be finalized in the feature breakdown):
 
 - `port/in`: `RegisterNotificationEventUseCase`, `DispatchPendingDeliveriesUseCase`, `AttemptDeliveryUseCase`, `QueryNotificationEventsUseCase`, `GetNotificationEventUseCase`, `ReplayDeliveryUseCase` — one method each, taking an immutable command record and returning an immutable result record. `Optional`/empty collections, never `null`.
-- `port/out`: `DeliveryRepositoryPort`, `DeliveryAttemptRepositoryPort`, `SubscriptionRepositoryPort`, `NotificationQueuePort`, `WebhookClientPort`, `ClockPort` (if the domain needs time beyond an injected `Clock`).
+- `port/out`: `DeliveryRepositoryPort`, `DeliveryAttemptRepositoryPort`, `SubscriptionRepositoryPort`, `NotificationQueuePort`, `WebhookClientPort`, `ClockPort` (if the domain needs time beyond an injected `Clock`). **Amendment D1 (2026-09-20):** `DeliveryRepositoryPort` is split into `DeliveryPipelineRepositoryPort` (cross-tenant) and `DeliveryQueryRepositoryPort` (tenant mandatory); the endpoints in §1's table consume only the latter. `ClockPort` was resolved as not needed (FEAT-003). See `## Amendments`.
 - `domain/model`: `NotificationEvent`, `Delivery`, `DeliveryStatus`, `DeliveryAttempt`, `Subscription`, `RetryPolicy` — plain Java records/enums, zero framework imports.
 
 ### 2. Target-URL ownership verification (GET challenge)
@@ -79,6 +79,36 @@ The columns themselves are defined in ADR-003 §3; only the rationale for them l
 | **A01 Broken Access Control (IDOR)** | The three endpoints above take a client-controlled id. | Fully designed in ADR-007; not restated here. |
 | **A07 Authentication Failures** | A public self-service API. | Fully designed in ADR-007; not restated here. |
 
+## Amendments
+
+Post-acceptance corrections, made on **Tech Lead directive of 2026-09-20** while reviewing the FEAT-004 persistence-adapter plan. `Status` is unchanged and is not an agent's to change.
+
+### D1. The three endpoints consume a tenant-mandatory query port
+
+`DeliveryRepositoryPort` is split (ADR-003 Amendment A2). `QueryNotificationEventsUseCase`, `GetNotificationEventUseCase` and `ReplayDeliveryUseCase` read through **`DeliveryQueryRepositoryPort`**, every method of which takes the tenant. `ReplayDeliveryUseCase` additionally writes through `DeliveryPipelineRepositoryPort.insert` for the new `PENDING` row, and §1's ordering requirement is unchanged and now structural: it resolves the target row tenant-scoped through the query port **first**, and checks `DEAD` second, so a foreign id is a 404 long before any state check runs (ADR-007 §5.5).
+
+### D2. The list endpoint's date filter and keyset key on `event_created_at`
+
+§1's list row always said "filters by **event creation date range**". The column that serves it is now `deliveries.event_created_at` (ADR-003 Amendment A4), denormalized from `notification_events.created_at` at insert, with the keyset tuple `(event_created_at, delivery_id)` and an index on `(client_id, event_created_at)`.
+
+This matters most for the endpoint this ADR designs, because this ADR is also the one that made replay an insert rather than a mutation. A replayed row's `deliveries.created_at` is the replay's own timestamp, so filtering on it would file a replayed delivery under the day someone pressed replay rather than the day the event happened, and a client querying the event's actual window would not find it. The port's filter parameters are named `eventCreatedFrom` / `eventCreatedTo` so the call site cannot confuse the two timestamps.
+
+The bounded page size (default 50, max 200) and the default 30-day window are unchanged, still proposals, and still applied on the way in by the web adapter or use case rather than by the persistence adapter.
+
+### D3. `findPage`'s optional filters collapse into one filter record
+
+The shape stated in D2 spelled the filters as four `Optional` **parameters** (`Optional<Instant> eventCreatedFrom`, `Optional<Instant> eventCreatedTo`, `Optional<DeliveryStatus> status`, `Optional<String> cursor`). `Optional` as a parameter type is an anti-pattern (Effective Java Item 55: `Optional` is a return type, not a parameter type) and it also produces a six-argument call site whose four middle arguments are same-shaped and positionally confusable — exactly what D2 was trying to prevent by naming the timestamps.
+
+The filters become a single immutable filter record, `DeliveryPageQuery` (`application/port/out/persistence/dto`, per the repo's package-by-kind convention):
+
+```
+DeliveryPage findPage(String clientId, DeliveryPageQuery query, int limit)
+```
+
+`DeliveryPageQuery` keeps `Optional<Instant> eventCreatedFrom`, `Optional<Instant> eventCreatedTo`, `Optional<DeliveryStatus> status`, `Optional<String> cursor` as its own components — `Optional` as a field/accessor return type is the normal case and is unchanged. Nothing else moves: `clientId` stays a separate, mandatory, first-position parameter so the tenant rule of D1 remains visible in the signature itself, `limit` stays a plain `int`, and `DeliveryPage`, `findById`, the semantics of every filter, the keyset tuple, the clamping and default-window rules of D2 are all untouched. This is a signature change only, not a behavior change.
+
+Delivered by `docs/features/FEAT-004-outbound-persistence-adapters/tasks/TASK-004-20-find-page-query-object.md`.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments D1-D3 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.
