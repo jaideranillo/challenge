@@ -4,16 +4,20 @@ import com.cobre.challenge.adapter.out.messaging.config.SqsProperties;
 import com.cobre.challenge.adapter.out.messaging.dto.NotificationEnvelope;
 import com.cobre.challenge.application.port.out.queue.NotificationQueuePort;
 import com.cobre.challenge.application.port.out.queue.dto.DeliveryPointer;
+import com.cobre.challenge.application.port.out.queue.dto.PublishBatchResult;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.springframework.stereotype.Component;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import tools.jackson.databind.ObjectMapper;
+import software.amazon.awssdk.services.sqs.model.BatchResultErrorEntry;
 import software.amazon.awssdk.services.sqs.model.GetQueueUrlRequest;
 import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
 import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequest;
 import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequestEntry;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 
 /**
@@ -62,14 +66,20 @@ public class SqsNotificationQueueAdapter implements NotificationQueuePort {
 	}
 
 	@Override
-	public void publishBatch(List<DeliveryPointer> pointers) {
+	public PublishBatchResult publishBatch(List<DeliveryPointer> pointers) {
+		List<UUID> failedDeliveryIds = new ArrayList<>();
+		// Chunks are sent sequentially; a throw on a later chunk leaves earlier chunks published and later ones unsent, which is safe since unsent rows are already QUEUED with a pushed next_attempt_at.
 		for (int start = 0; start < pointers.size(); start += BATCH_CHUNK_SIZE) {
 			List<DeliveryPointer> chunk = pointers.subList(start, Math.min(start + BATCH_CHUNK_SIZE, pointers.size()));
-			sqsClient.sendMessageBatch(SendMessageBatchRequest.builder()
+			SendMessageBatchResponse response = sqsClient.sendMessageBatch(SendMessageBatchRequest.builder()
 					.queueUrl(queueUrl)
 					.entries(toBatchEntries(chunk))
 					.build());
+			for (BatchResultErrorEntry error : response.failed()) {
+				failedDeliveryIds.add(chunk.get(Integer.parseInt(error.id())).deliveryId());
+			}
 		}
+		return new PublishBatchResult(pointers.size() - failedDeliveryIds.size(), failedDeliveryIds);
 	}
 
 	private List<SendMessageBatchRequestEntry> toBatchEntries(List<DeliveryPointer> chunk) {

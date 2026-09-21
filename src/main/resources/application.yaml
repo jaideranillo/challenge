@@ -8,3 +8,9 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: false
+
+challenge:
+  relay:
+    enabled: true # ADR-002 §2.1: on by default; off only for the acceptance tests (TASK-006-10/11)
+    poll-interval: 5s # ADR-002 §2.1: "a scheduled job, fixedDelay, 5s"
+    batch-limit: 500 # ADR-002 §2.1: due-query "LIMIT 500"

@@ -376,32 +376,16 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
     /**
      * {@inheritDoc}
      *
-     * <p><strong>ADR-002 §2.1.</strong> Selects due deliveries and, in the same caller transaction,
-     * promotes them to {@code QUEUED} and pushes {@code next_attempt_at} forward by 5 minutes.
+     * <p>Requires an active transaction (asserted, throws {@link IllegalStateException} otherwise) —
+     * {@code SKIP LOCKED} outside one lets every relay instance claim the same batch.
      *
-     * <p><strong>Requires an active transaction.</strong> {@code SKIP LOCKED} outside a
-     * transaction acquires no lasting locks — every relay instance would claim the same batch and
-     * the whole design silently double-sends. This method asserts
-     * {@link TransactionSynchronizationManager#isActualTransactionActive()} before executing any
-     * SQL and throws {@link IllegalStateException} if false (A10 fail-closed).
-     * {@code @Transactional} is deliberately <em>not</em> added to this class; the assertion
-     * exists precisely to catch a caller that forgot its own transaction.
+     * <p>{@code FOR UPDATE OF d} locks only {@code deliveries}, not {@code subscriptions} — locking
+     * the driving row would make relay instances skip each other's rows on a busy subscription.
      *
-     * <p><strong>{@code FOR UPDATE OF d SKIP LOCKED}.</strong> The {@code OF d} clause locks only
-     * the {@code deliveries} rows. A bare {@code FOR UPDATE ... SKIP LOCKED} would also lock the
-     * joined {@code subscriptions} row, causing two relay instances working on different
-     * deliveries of the same busy subscription to skip each other's rows and silently under-claim.
-     * {@code OF d} is load-bearing. ADR-002 §2.1's text writes the bare form; this refinement is
-     * intentional and implements §2.1's stated intent ("each takes a disjoint batch" of
-     * <em>deliveries</em>).
-     *
-     * <p>{@code asOf} replaces every {@code now()} in all six predicates so a single poll cycle
-     * evaluates the grace window and cooldown against one consistent instant.
-     *
-     * <p>Interval arithmetic stays in SQL; the 30s/60s grace windows are SQL literals so a
-     * reviewer can diff them line-by-line against ADR-002 §2.1.
-     *
-     * <p>Returns an empty list if no rows are due (Effective Java Item 54).
+     * <p>Cap is per-subscription {@code LATERAL} (bounded by {@code remaining_allowance}) before
+     * the outer {@code LIMIT :batch_limit} — capping a global pool after selection would let one
+     * saturated subscription starve the rest. {@code CROSS JOIN LATERAL}, not {@code LEFT}: Postgres
+     * rejects a locking clause on the nullable side of an outer join.
      */
     @Override
     public List<Delivery> claimDue(int batchLimit, Instant asOf) {
@@ -415,30 +399,74 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
             throw new IllegalArgumentException("batchLimit must be positive, was " + batchLimit);
         }
 
-        // One compound statement: SELECT with SKIP LOCKED inside a CTE, UPDATE in a second CTE,
-        // RETURNING the updated rows. Both CTEs share the same snapshot and transaction.
+        // One compound statement: SELECT (LATERAL-bounded, SKIP LOCKED) inside a CTE, UPDATE in
+        // a second CTE, RETURNING the updated rows. Both CTEs share the same snapshot and
+        // transaction.
         //
-        // The six WHERE predicates reproduce ADR-002 §2.1 verbatim, with :as_of replacing now():
+        // Driving relation: subscriptions, not deliveries. Subscription-side predicates
+        // (deliverability, circuit cooldown, throttle) are evaluated once per subscription in the
+        // outer WHERE. Two LATERAL joins per subscription:
+        //   a) a scalar remaining_allowance = GREATEST(0, effective_cap - already_in_flight)
+        //   b) up to remaining_allowance of that subscription's oldest candidate deliveries,
+        //      locked FOR UPDATE OF d SKIP LOCKED
+        //
+        // Delivery-side predicates (the four below) reproduce ADR-002 §2.1 verbatim, with
+        // :as_of replacing now(), and are textually unchanged from before this task:
         //   1. status IN (PENDING, RETRYING, QUEUED, PROCESSING)
         //   2. next_attempt_at <= :as_of
         //   3. PENDING grace: d.created_at < :as_of - 30s
         //   4. PROCESSING staleness: d.updated_at < :as_of - 60s (crashed-worker reclaim)
+        // Subscription-side predicates, evaluated once per subscription in the outer WHERE:
         //   5. Circuit cooldown: circuit_opened_at < :as_of - circuit_backoff (elapsed => probe)
         //   6. Throttle: throttled_until is null or past
+        //   7. Deliverability gate (new): active AND verification_state = 'VERIFIED'
         String sql =
                 "WITH claimed AS ("
                         + "  SELECT d.delivery_id"
-                        + "  FROM deliveries d"
-                        + "  JOIN subscriptions s ON s.subscription_id = d.subscription_id"
-                        + "  WHERE d.status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING')"
-                        + "    AND d.next_attempt_at <= :as_of"
-                        + "    AND (d.status <> 'PENDING'    OR d.created_at < :as_of - interval '30 seconds')"
-                        + "    AND (d.status <> 'PROCESSING' OR d.updated_at < :as_of - interval '60 seconds')"
+                        + "  FROM subscriptions s"
+                        + "  CROSS JOIN LATERAL ("
+                        + "    SELECT GREATEST("
+                        + "             0,"
+                        + "             (CASE WHEN s.circuit_state = 'CLOSED' THEN s.max_concurrency ELSE 1 END)"
+                        // Two-branch CASE, deliberately no 0 arm: a still-cooling OPEN circuit is
+                        // already excluded by predicate 5 in the outer WHERE below, so any row that
+                        // reaches this cap has circuit_state IN ('CLOSED', 'HALF_OPEN', or a cooled
+                        // OPEN probe) — HALF_OPEN and a cooled OPEN probe both take the one-probe
+                        // cap of 1 (ADR-006 §1.2). A third branch for OPEN would be dead code.
+                        + "             - ("
+                        + "                 SELECT count(*)"
+                        + "                 FROM deliveries di"
+                        + "                 WHERE di.subscription_id = s.subscription_id"
+                        + "                   AND di.status IN ('QUEUED', 'PROCESSING')"
+                        // Non-candidate in-flight rows only: a QUEUED/PROCESSING row this cycle's
+                        // candidate predicate (below) would itself admit as reclaimable is excluded
+                        // here, so it is never double-counted against the cap.
+                        + "                   AND ("
+                        + "                         di.next_attempt_at IS NULL"
+                        + "                         OR di.next_attempt_at > :as_of"
+                        + "                         OR (di.status = 'PROCESSING' AND di.updated_at >= :as_of - interval '60 seconds')"
+                        + "                       )"
+                        + "               )"
+                        + "           ) AS remaining_allowance"
+                        + "  ) a"
+                        + "  CROSS JOIN LATERAL ("
+                        + "    SELECT d.delivery_id, d.next_attempt_at"
+                        + "    FROM deliveries d"
+                        + "    WHERE d.subscription_id = s.subscription_id"
+                        + "      AND d.status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING')"
+                        + "      AND d.next_attempt_at <= :as_of"
+                        + "      AND (d.status <> 'PENDING'    OR d.created_at < :as_of - interval '30 seconds')"
+                        + "      AND (d.status <> 'PROCESSING' OR d.updated_at < :as_of - interval '60 seconds')"
+                        + "    ORDER BY d.next_attempt_at, d.delivery_id"
+                        + "    LIMIT a.remaining_allowance"
+                        + "    FOR UPDATE OF d SKIP LOCKED"
+                        + "  ) d"
+                        + "  WHERE s.active"
+                        + "    AND s.verification_state = 'VERIFIED'"
                         + "    AND (s.circuit_state <> 'OPEN' OR s.circuit_opened_at < :as_of - s.circuit_backoff)"
                         + "    AND (s.throttled_until IS NULL OR s.throttled_until <= :as_of)"
-                        + "  ORDER BY d.next_attempt_at"
+                        + "  ORDER BY d.next_attempt_at, d.delivery_id"
                         + "  LIMIT :batch_limit"
-                        + "  FOR UPDATE OF d SKIP LOCKED"
                         + "),"
                         + "updated AS ("
                         + "  UPDATE deliveries"

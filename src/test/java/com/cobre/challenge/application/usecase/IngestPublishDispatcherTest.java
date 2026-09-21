@@ -9,6 +9,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.cobre.challenge.application.port.out.queue.NotificationQueuePort;
 import com.cobre.challenge.application.port.out.queue.dto.DeliveryPointer;
+import com.cobre.challenge.application.port.out.queue.dto.PublishBatchResult;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
 import java.util.Optional;
@@ -169,8 +170,9 @@ class IngestPublishDispatcherTest {
         }
 
         @Override
-        public void publishBatch(List<DeliveryPointer> pointers) {
+        public PublishBatchResult publishBatch(List<DeliveryPointer> pointers) {
             pointers.forEach(this::publish);
+            return new PublishBatchResult(pointers.size(), List.of());
         }
     }
 }

@@ -256,8 +256,7 @@ public class SubscriptionJdbcRepository implements SubscriptionRepositoryPort {
     public boolean promoteToHalfOpen(UUID subscriptionId, Instant asOf) {
         String sql =
                 "UPDATE subscriptions"
-                        + " SET circuit_state = 'HALF_OPEN'::circuit_state,"
-                        + "     updated_at = :as_of"
+                        + " SET circuit_state = 'HALF_OPEN'::circuit_state"
                         + " WHERE subscription_id = :id"
                         + "   AND circuit_state = 'OPEN'::circuit_state"
                         + "   AND circuit_opened_at < :as_of - circuit_backoff";
