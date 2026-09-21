@@ -167,8 +167,16 @@ class ClaimDueConcurrencyTest {
     @Test
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
     void claimDue_forUpdateOfD_twoDeliveriesSameSubscription_bothClaimed() throws Exception {
-        // Two deliveries for the same subscription
-        seedDueDeliveriesForSubscription(subscriptionId, 2);
+        // A dedicated subscription with max_concurrency = 1 (TASK-006-01): with the default
+        // max_concurrency = 10 fixture, the per-subscription LATERAL's inner LIMIT
+        // (remaining_allowance) would legitimately lock both of this test's two due rows on
+        // the very first claimDue(1) call - the documented accepted consequence of capping
+        // per subscription before the outer batchLimit is applied - leaving T2 nothing to
+        // claim until T1 commits. Capping this subscription at 1 keeps the inner LIMIT and
+        // the outer batchLimit equal, which is what this test needs to isolate FOR UPDATE OF d
+        // (one locked delivery row per concurrent call) from the per-subscription cap.
+        UUID sid = insertSubscriptionWithMaxConcurrency(clientId, 1);
+        seedDueDeliveriesForSubscription(sid, 2);
 
         List<UUID>[] claims = new List[2];
         AtomicReference<Throwable> t1Err = new AtomicReference<>();
@@ -278,12 +286,30 @@ class ClaimDueConcurrencyTest {
         return deliveryId;
     }
 
+    // verification_state = 'VERIFIED' bound explicitly (TASK-006-01): the column's own DEFAULT
+    // is PENDING_VERIFICATION (ADR-005 §2), which the deliverability gate now excludes. Without
+    // this every claimDue call in this class would see zero admissible rows from a gate, not
+    // from the concurrency behaviour under test.
     private UUID insertSubscription(String cid) {
         UUID sid = UUID.randomUUID();
         jdbc.update(
-                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, event_types) "
-                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', ARRAY['payment.completed']::text[])",
+                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
+                        + "event_types, verification_state) "
+                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
+                        + "ARRAY['payment.completed']::text[], 'VERIFIED')",
                 new MapSqlParameterSource().addValue("id", sid).addValue("cid", cid));
+        return sid;
+    }
+
+    private UUID insertSubscriptionWithMaxConcurrency(String cid, int maxConcurrency) {
+        UUID sid = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
+                        + "event_types, verification_state, max_concurrency) "
+                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
+                        + "ARRAY['payment.completed']::text[], 'VERIFIED', :mc)",
+                new MapSqlParameterSource()
+                        .addValue("id", sid).addValue("cid", cid).addValue("mc", maxConcurrency));
         return sid;
     }
 

@@ -200,6 +200,111 @@ class ClaimDuePredicateTest {
         assertThat(result).isNotNull().isEmpty();
     }
 
+    // -----------------------------------------------------------------------
+    // TASK-006-02 scenarios 1-6 (TASK-006-01's LATERAL restructure)
+    // -----------------------------------------------------------------------
+
+    /** Scenario 1: PENDING row inside the 30s grace window is not claimed. */
+    @Test
+    void graceWindow_inside_notClaimed() {
+        UUID id = seedDeliveryWithCreatedAt(subscriptionId, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(10, ChronoUnit.SECONDS));
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, id, "PENDING");
+    }
+
+    /** Scenario 2: PENDING row outside the 30s grace window is claimed. */
+    @Test
+    void graceWindow_outside_claimed() {
+        UUID id = seedDeliveryWithCreatedAt(subscriptionId, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(31, ChronoUnit.SECONDS));
+
+        List<Delivery> result = claimDue(10);
+
+        assertClaimed(result, id);
+    }
+
+    /** Scenario 3: OPEN circuit still cooling down excludes the row. */
+    @Test
+    void openCircuit_stillCooling_notClaimed() {
+        UUID sid = insertSubscriptionWithCircuit("OPEN",
+                asOf.minus(10, ChronoUnit.SECONDS), "1 minute");
+        UUID id = seedDelivery(sid, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, id, "PENDING");
+    }
+
+    /** Scenario 4: active throttle excludes the row; an expired throttle does not. */
+    @Test
+    void throttle_active_notClaimed_expired_claimed() {
+        UUID throttled = insertSubscriptionWithThrottle(asOf.plus(1, ChronoUnit.MINUTES));
+        UUID expired = insertSubscriptionWithThrottle(asOf.minus(1, ChronoUnit.SECONDS));
+        UUID excluded = seedDelivery(throttled, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+        UUID included = seedDelivery(expired, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, excluded, "PENDING");
+        assertClaimed(result, included);
+    }
+
+    /** Scenario 5: next_attempt_at in the future excludes the row; exactly asOf claims it (predicate is <=). */
+    @Test
+    void nextAttemptAt_future_notClaimed_exactlyAsOf_claimed() {
+        UUID excluded = seedDelivery(subscriptionId, "PENDING",
+                asOf.plus(1, ChronoUnit.SECONDS), asOf.minus(5, ChronoUnit.MINUTES), null);
+        UUID included = seedDelivery(subscriptionId, "PENDING",
+                asOf, asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, excluded, "PENDING");
+        assertClaimed(result, included);
+    }
+
+    /** Scenario 6a: an inactive subscription's otherwise-claimable row is excluded. */
+    @Test
+    void deliverabilityGate_inactiveSubscription_notClaimed() {
+        UUID sid = insertSubscriptionWithActiveAndVerification(false, "VERIFIED");
+        UUID id = seedDelivery(sid, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, id, "PENDING");
+    }
+
+    /** Scenario 6b: a subscription pending verification's otherwise-claimable row is excluded. */
+    @Test
+    void deliverabilityGate_pendingVerification_notClaimed() {
+        UUID sid = insertSubscriptionWithActiveAndVerification(true, "PENDING_VERIFICATION");
+        UUID id = seedDelivery(sid, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertNotClaimed(result, id, "PENDING");
+    }
+
+    /** Scenario 6c: an active, verified subscription's row is claimed. */
+    @Test
+    void deliverabilityGate_activeAndVerified_claimed() {
+        UUID sid = insertSubscriptionWithActiveAndVerification(true, "VERIFIED");
+        UUID id = seedDelivery(sid, "PENDING",
+                asOf.minus(1, ChronoUnit.MINUTES), asOf.minus(5, ChronoUnit.MINUTES), null);
+
+        List<Delivery> result = claimDue(10);
+
+        assertClaimed(result, id);
+    }
+
     /**
      * Test 16: EXPLAIN shows idx_deliveries_due is used; no seq scan on deliveries.
      *
@@ -327,11 +432,19 @@ class ClaimDuePredicateTest {
         return deliveryId;
     }
 
+    // verification_state = 'VERIFIED' is bound explicitly in every subscription fixture below
+    // (TASK-006-01): the column's own DEFAULT is PENDING_VERIFICATION (ADR-005 §2), which the
+    // deliverability gate now excludes. Without this, every claimDue fixture in this class would
+    // seed an undeliverable subscription and every row it owns would be silently dropped by the
+    // new gate rather than by the predicate under test.
+
     private UUID insertSubscription(String cid) {
         UUID sid = UUID.randomUUID();
         jdbc.update(
-                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, event_types) "
-                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', ARRAY['payment.completed']::text[])",
+                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
+                        + "event_types, verification_state) "
+                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
+                        + "ARRAY['payment.completed']::text[], 'VERIFIED')",
                 new MapSqlParameterSource().addValue("id", sid).addValue("cid", cid));
         return sid;
     }
@@ -340,9 +453,9 @@ class ClaimDuePredicateTest {
         UUID sid = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
-                        + "event_types, circuit_state, circuit_opened_at, circuit_backoff) "
+                        + "event_types, verification_state, circuit_state, circuit_opened_at, circuit_backoff) "
                         + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
-                        + "ARRAY['payment.completed']::text[], :cs::circuit_state, :oa, :cb::interval)",
+                        + "ARRAY['payment.completed']::text[], 'VERIFIED', :cs::circuit_state, :oa, :cb::interval)",
                 new MapSqlParameterSource()
                         .addValue("id", sid).addValue("cid", clientId)
                         .addValue("cs", circuitState)
@@ -355,9 +468,9 @@ class ClaimDuePredicateTest {
         UUID sid = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
-                        + "event_types, throttled_until) "
+                        + "event_types, verification_state, throttled_until) "
                         + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
-                        + "ARRAY['payment.completed']::text[], :tu)",
+                        + "ARRAY['payment.completed']::text[], 'VERIFIED', :tu)",
                 new MapSqlParameterSource()
                         .addValue("id", sid).addValue("cid", clientId)
                         .addValue("tu", throttledUntil != null
@@ -368,6 +481,36 @@ class ClaimDuePredicateTest {
     private String readStatus(UUID id) {
         return jdbc.queryForObject("SELECT status FROM deliveries WHERE delivery_id = :id",
                 new MapSqlParameterSource("id", id), String.class);
+    }
+
+    /** Asserts a row is absent from the result and its table state is unchanged. */
+    private void assertNotClaimed(List<Delivery> result, UUID id, String expectedStatus) {
+        assertThat(result.stream().map(Delivery::deliveryId)).doesNotContain(id);
+        assertThat(readStatus(id)).isEqualTo(expectedStatus);
+    }
+
+    /** Asserts a row is present in the result and transitioned to QUEUED with next_attempt_at pushed. */
+    private void assertClaimed(List<Delivery> result, UUID id) {
+        assertThat(result.stream().map(Delivery::deliveryId)).contains(id);
+        assertThat(readStatus(id)).isEqualTo("QUEUED");
+        OffsetDateTime nextAttemptAt = jdbc.queryForObject(
+                "SELECT next_attempt_at FROM deliveries WHERE delivery_id = :id",
+                new MapSqlParameterSource("id", id), OffsetDateTime.class);
+        assertThat(nextAttemptAt.toInstant().truncatedTo(ChronoUnit.SECONDS))
+                .isEqualTo(asOf.plus(5, ChronoUnit.MINUTES).truncatedTo(ChronoUnit.SECONDS));
+    }
+
+    private UUID insertSubscriptionWithActiveAndVerification(boolean active, String verificationState) {
+        UUID sid = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO subscriptions (subscription_id, client_id, target_url, secret_ref, "
+                        + "event_types, active, verification_state) "
+                        + "VALUES (:id, :cid, 'https://example.com/hook', 'ref', "
+                        + "ARRAY['payment.completed']::text[], :active, :vs::verification_state)",
+                new MapSqlParameterSource()
+                        .addValue("id", sid).addValue("cid", clientId)
+                        .addValue("active", active).addValue("vs", verificationState));
+        return sid;
     }
 
     private boolean usesIndex(JsonNode node, String indexName) {

@@ -155,11 +155,9 @@ public interface DeliveryPipelineRepositoryPort {
     boolean deferDelivery(UUID deliveryId, Instant nextAttemptAt);
 
     /**
-     * Claims due deliveries for dispatch in one batch.
-     *
-     * <p>Uses {@code FOR UPDATE ... SKIP LOCKED} to avoid contention across workers.
-     * Bounded by {@code batchLimit} rows and the {@code next_attempt_at <= asOf} predicate
-     * (ADR-002 §2.1).
+     * Claims due deliveries, capped per subscription before {@code batchLimit} applies
+     * (ADR-002 §2.1, ADR-005 §2 deliverability gate, ADR-006 §1.2 in-flight cap: 0 OPEN /
+     * 1 HALF_OPEN / max_concurrency CLOSED).
      */
     List<Delivery> claimDue(int batchLimit, Instant asOf);
 }

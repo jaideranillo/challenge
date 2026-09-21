@@ -9,6 +9,7 @@ import com.cobre.challenge.application.port.out.persistence.NotificationEventRep
 import com.cobre.challenge.application.port.out.persistence.SubscriptionRepositoryPort;
 import com.cobre.challenge.application.port.out.queue.NotificationQueuePort;
 import com.cobre.challenge.application.port.out.queue.dto.DeliveryPointer;
+import com.cobre.challenge.application.port.out.queue.dto.PublishBatchResult;
 import com.cobre.challenge.application.port.out.tracing.TraceContextPort;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.event.NotificationEvent;
@@ -279,8 +280,8 @@ class RegisterNotificationEventUseCaseImplTest {
         }
 
         @Override
-        public void publishBatch(List<DeliveryPointer> pointers) {
-            // no-op
+        public PublishBatchResult publishBatch(List<DeliveryPointer> pointers) {
+            return new PublishBatchResult(pointers.size(), List.of());
         }
     }
 }
