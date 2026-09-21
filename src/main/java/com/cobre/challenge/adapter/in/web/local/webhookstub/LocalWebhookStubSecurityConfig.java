@@ -32,8 +32,6 @@ class LocalWebhookStubSecurityConfig {
     SecurityFilterChain localWebhookStubFilterChain(HttpSecurity http) throws Exception {
         http.securityMatcher("/local/webhook-stub/**")
                 .authorizeHttpRequests(authorize -> authorize.anyRequest().permitAll())
-                // CSRF is irrelevant here: stub is permitAll, unauthenticated, local-profile-only,
-                // and exists only to be curled/scripted from tools with no browser session/cookie.
                 .csrf(AbstractHttpConfigurer::disable);
         return http.build();
     }
