@@ -102,7 +102,7 @@ Both are gateway-side invariants, enforced before the row is written, inside the
 
 ### 3. Data model
 
-Four tables. `notification_events` and `subscriptions` are inputs; `deliveries` is the outbox and sole source of truth; `delivery_attempts` is its append-only history. Exact SQL/migration/partitioning is the DBA's call in the feature breakdown — this is the contract, not the DDL.
+Four tables. `notification_events` and `subscriptions` are inputs; `deliveries` is the outbox and sole source of truth; `delivery_attempts` is its append-only history. Exact SQL/migration detail is the DBA's call in the feature breakdown — this is the contract, not the DDL. Neither table is partitioned; see the partitioning paragraph at the end of this section.
 
 ```mermaid
 erDiagram
@@ -201,7 +201,13 @@ Indexes (contract-level, exact definitions belong to the DBA task):
 - Index on `(client_id, created_at)` for the list endpoint's default ordering and date-range filter, keyset-paginated (ADR-005 §1).
 - Index on `(client_id, status)` for the `delivery_status` filter.
 
-Partitioning: the whiteboard's date-partitioning note is honored by range-partitioning `deliveries` (and `delivery_attempts`) on `created_at`, monthly. Terminal rows (`DELIVERED`, `DEAD`) older than a retention window are archived/dropped by partition, not by row-level delete — the DBA task owns the exact retention period.
+**Partitioning: deferred, not implemented.** `deliveries` and `delivery_attempts` are plain (unpartitioned) tables. The whiteboard's date-partitioning note is recorded here as a **future performance/scalability improvement**, to be revisited once actual data volume or retention pressure justifies it — at the volumes this service is being built for, it is not needed, and it is not worth its cost today.
+
+That cost is concrete, and it is what settled the decision (user's call, after seeing a partitioned implementation): PostgreSQL requires every unique index and primary key on a partitioned table to include all partition-key columns. Partitioning `deliveries` on `created_at` therefore makes §2's partial unique index on `(event_id, subscription_id)` un-creatable as written — adding `created_at` to it would permit two live rows for the same pair and destroy the invariant — so the invariant had to be pushed onto a side table maintained by a trigger. Unpartitioned, none of that is necessary.
+
+**The §2 idempotency invariant is therefore implemented the textbook way: a native PostgreSQL partial unique index directly on `deliveries (event_id, subscription_id) WHERE status NOT IN ('DELIVERED', 'DEAD', 'FAILED')`. No side table, no trigger, no application-level check.** `PRIMARY KEY (delivery_id)` is likewise a plain single-column PK, so `delivery_id` (the public API identifier, §3) is database-guaranteed unique and the ordinary foreign keys (`replayed_from -> deliveries(delivery_id)`, `delivery_attempts.delivery_id -> deliveries(delivery_id)`) are creatable normally.
+
+Retention consequently becomes an ordinary row-level concern rather than a drop-by-partition one, and no retention mechanism is specified or implemented at this time. When partitioning is revisited, retention-by-partition-drop, the exact retention period, and the invariant-preserving mechanism all come back with it — as a superseding ADR, not as a migration comment.
 
 **`delivery_attempts`** — append-only, one row per HTTP attempt (or per attempted-but-failed-before-HTTP case, e.g. URL revalidation failure). No separate `outcome` enum column: success/retryable/non-retryable is derived from `http_status`/`error` using the same classification as ADR-004 §1 (including the 3xx / 408 / 429 nuances), not stored redundantly. `response_excerpt` is truncated and never contains signature headers or secrets (A09). This table is what makes a client complaint ("you never called me at 14:02") answerable with a query instead of a guess, and it is what the SQS-DLQ observer (if built, per the earlier DLQ analysis) would correlate against via `delivery_id` when raising an admin alert — the DLQ message itself carries no delivery history, only the pointer. Kept separate rather than collapsed into a JSONB column on `deliveries` because the monitoring requirement is answered with queries over it: p95 endpoint latency per client, failure rate over a window, full history behind a single complaint.
 
@@ -211,7 +217,7 @@ Partitioning: the whiteboard's date-partitioning note is honored by range-partit
 - The domain (state machine, retry policy, tenant check) is framework-free and unit-testable with no Spring context.
 
 **Becomes harder / debt created**
-- `deliveries` is write-hot: needs a partial index on `(status, next_attempt_at)` for the claim query, a retention/partitioning plan (the whiteboard's date-partitioning note), and archival of terminal rows. Owned by the DBA in a later task.
+- `deliveries` is write-hot: needs a partial index on `(status, next_attempt_at)` for the claim query. A retention plan and archival of terminal rows are **not** solved today — partitioning is deferred (§3), so retention-by-partition-drop is deferred with it, and no row-level retention is specified either. This is accepted debt: it is revisited together with partitioning, as a superseding ADR, when volume justifies it.
 - At-least-once puts a deduplication obligation on clients; this must be in the public webhook documentation.
 
 ## OWASP / Security Impact
@@ -230,4 +236,4 @@ Carried from the master Q-list in `docs/architecture-overview.md`; these three a
 
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-001-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.

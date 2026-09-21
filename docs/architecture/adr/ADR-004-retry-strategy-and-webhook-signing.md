@@ -150,4 +150,4 @@ Carried from the master Q-list in `docs/architecture-overview.md`; these two are
 
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-001-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.
