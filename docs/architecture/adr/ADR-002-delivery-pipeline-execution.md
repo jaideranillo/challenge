@@ -164,6 +164,31 @@ Carried from the master Q-list in `docs/architecture-overview.md`; these two are
   **Decision:** metrics stay tagged by `event_type` and status class only, as §3 already specifies. Per-client and per-subscription drill-down — including the "group after" analysis the proposal was after — happens against **logs and traces** (Loki/Tempo), which already carry `delivery_id`, `client_id` and `event_id` on every structured log line and span (§3) and are naturally filterable per client at no cardinality cost, unlike a Mimir label. Tagging by client or subscription is therefore **rejected**, and the expected client count is no longer a blocking input, because the answer does not depend on it. If a persistent per-client or per-subscription *dashboard* (a standing panel, not an ad hoc query) is genuinely needed later, the safe path is **log-derived metrics** — e.g. LogQL recording rules aggregating fields already present in the logs — rather than raw high-cardinality labels on the primary metric stream. That is a bounded, reversible follow-up, not a reason to change the primary instrumentation now.
 - **Q10 — Event ingress mechanism and producer auth (resolved: HTTP, authenticated with AWS IAM).** Synchronous HTTP endpoint, not a queue listener — pinned in §1.1. The gateway validates, resolves subscriptions, writes `notification_events`/`deliveries` in one transaction, and responds `202` before ever touching SQS. The producer-authentication mechanism, previously the one unspecified piece of the ingest path, is now resolved: **internal platform services authenticate to the ingest endpoint via AWS IAM (SigV4-signed requests / IAM role-based auth)**. The rationale is that the platform already runs on AWS — SQS is confirmed in Q1 — so the internal call rides the identity, rotation and revocation machinery that already exists rather than introducing a bespoke service token, a signed internal JWT, or mTLS, each of which would need its own issuance and rotation story to reach the same place. This credential is explicitly distinct from the self-service API's per-client auth (§1.1 step 1; OWASP A07 is designed in ADR-007): two different callers, two different identity systems, no shared credential. What remains is **a security-engineer implementation detail, not an open architectural question** — which IAM role/policy the producers assume, and whether the SigV4 verification happens at the edge or in the application — and it belongs in that agent's task in the feature breakdown.
 
+## Amendments
+
+Post-acceptance corrections to this ADR's contract-level text, made on **Tech Lead directive of 2026-09-20** while reviewing the FEAT-004 persistence-adapter plan. Nothing in §2.1's query or §2.2's per-message flow changes; these name the port operations each step invokes, which were previously a single generic status transition. `Status` is unchanged and is not an agent's to change.
+
+### C1. §2.2's steps now name their operations
+
+| §2.2 step | Operation on `DeliveryPipelineRepositoryPort` |
+| --- | --- |
+| Step 1, conditional claim `QUEUED -> PROCESSING` | `claimForProcessing(deliveryId, now)`, guarded `status = 'QUEUED'` |
+| Step 2, zero rows affected | the `false` return of step 1. Unchanged: still not an exception, still followed by `DeleteMessage` |
+| Step 3, bulkhead-timeout deferral | `deferDelivery(deliveryId, nextAttemptAt)`, guarded `status = 'QUEUED'` |
+| Step 4, open-circuit deferral | `deferDelivery`, same operation as step 3 |
+| Step 6, outcome write | `markDelivered` \| `scheduleRetry` \| `markDead` (ADR-003 §1.1, Amendment A1) |
+| Step 6, probe circuit transition | `closeCircuit` on 2xx, `reopenCircuit` on a breaker-counting failure (ADR-006 §1.2, Amendment B2) |
+
+Between steps 1 and 5 the worker also loads the claimed row through the pipeline port's cross-tenant `findById(deliveryId)`, for `event_id`, `subscription_id`, the authoritative `attempt_count` and the persisted `trace_context` (§3.1's fallback path). That read was not previously expressible on any port; see ADR-003 Amendment A2 and ADR-007's own `## Amendments` for why an unscoped `findById` is correct on the pipeline port and still forbidden on the client-facing one.
+
+**`deferDelivery` is what steps 3 and 4 already described, made enforceable.** Both steps state that no attempt occurred, so `attempt_count` does not move and no `delivery_attempts` row is written. As a generic status transition that was a prose constraint an implementer had to remember. As a named operation whose only writes are `next_attempt_at` and `updated_at`, it is a property of the contract. The row stays `QUEUED`.
+
+### C2. §2.1's recovery trigger is `promoteToHalfOpen`
+
+§2.1's "This query is also the circuit's recovery trigger" paragraph and ADR-006 §1.2's `OPEN -> HALF_OPEN` row describe one write, now named `promoteToHalfOpen(subscriptionId, asOf)` on `SubscriptionRepositoryPort`. It keeps ADR-006 §1.2's compound guard, including the elapsed-cooldown predicate, so the promotion is atomic rather than a read-then-write race against another relay instance. The relay passes the same `asOf` instant its due-query used, so one poll cycle evaluates against one clock.
+
+The due-query itself is unchanged, and the promotion remains a separate write the relay use case issues for subscriptions the query admitted as cooled-down. No reaper job, no timer, exactly as §2.1 already says.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments C1-C2 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.

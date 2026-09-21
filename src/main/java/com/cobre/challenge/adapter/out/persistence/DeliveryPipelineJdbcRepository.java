@@ -1,0 +1,413 @@
+package com.cobre.challenge.adapter.out.persistence;
+
+import com.cobre.challenge.adapter.out.persistence.mapper.DeliveryRowMapper;
+import com.cobre.challenge.application.port.out.persistence.DeliveryPipelineRepositoryPort;
+import com.cobre.challenge.domain.model.delivery.Delivery;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+/**
+ * JDBC implementation of {@link DeliveryPipelineRepositoryPort}.
+ *
+ * <p>No {@code @Transactional}: transaction boundaries are the use case's responsibility
+ * (CLAUDE.md, ADR-005 §1). Each method is a single, atomic SQL statement; the caller's
+ * transaction context is the unit of work.
+ *
+ * <p>No {@code synchronized} and no {@code ThreadLocal} — this bean is stateless and safe
+ * to share across virtual threads (ADR-002 §2).
+ */
+@Repository
+public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositoryPort {
+
+    // Columns selected in every delivery read — explicit list prevents SELECT * collisions
+    // when this query is used inside a JOIN (e.g. claimDue).
+    private static final String DELIVERY_COLUMNS =
+            "d.delivery_id, d.event_id, d.subscription_id, d.client_id, d.status, d.origin, "
+                    + "d.replayed_from, d.attempt_count, d.next_attempt_at, d.last_error, "
+                    + "d.delivered_at, d.event_created_at, d.trace_context";
+
+    // The relay's 5-minute recovery push. This is a dispatch policy rather than a storage
+    // detail; it lives here as a constant because claimDue()'s port has no interval parameter
+    // (logged in docs/concerns.md).
+    private static final String CLAIM_DUE_PUSH_INTERVAL = "5 minutes";
+
+    private final NamedParameterJdbcTemplate jdbcTemplate;
+    private final DeliveryRowMapper deliveryRowMapper;
+
+    public DeliveryPipelineJdbcRepository(
+            NamedParameterJdbcTemplate jdbcTemplate, DeliveryRowMapper deliveryRowMapper) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.deliveryRowMapper = deliveryRowMapper;
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-004-06: insert and findById
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Binds {@code event_created_at} from {@link Delivery#eventCreatedAt()} — never from
+     * {@code now()} or {@code created_at}. For a {@code REPLAY} or {@code RECOVERED} row the two
+     * differ; binding from the aggregate is the whole point of ADR-003 Amendment A4.
+     *
+     * <p>Does not catch {@link org.springframework.dao.DuplicateKeyException}. The partial unique
+     * index {@code idx_deliveries_live_pair} is the idempotency guard (ADR-003 §2) and its
+     * violation is a real outcome the use case must see (ADR-005 §1 maps it to 409). Swallowing
+     * it here would make a double replay look like a success.
+     */
+    @Override
+    public Delivery insert(Delivery delivery) {
+        String sql =
+                "INSERT INTO deliveries ("
+                        + "  delivery_id, event_id, subscription_id, client_id, status, origin,"
+                        + "  replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
+                        + "  event_created_at, trace_context"
+                        + ") VALUES ("
+                        + "  :delivery_id, :event_id, :subscription_id, :client_id,"
+                        + "  :status::delivery_status, :origin::delivery_origin,"
+                        + "  :replayed_from, :attempt_count, :next_attempt_at, :last_error, :delivered_at,"
+                        + "  :event_created_at, :trace_context"
+                        + ") RETURNING "
+                        + "  delivery_id, event_id, subscription_id, client_id, status, origin,"
+                        + "  replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
+                        + "  event_created_at, trace_context";
+
+        Map<String, Object> params = new HashMap<>();
+        params.put("delivery_id", delivery.deliveryId());
+        params.put("event_id", delivery.eventId());
+        params.put("subscription_id", delivery.subscriptionId());
+        params.put("client_id", delivery.clientId());
+        params.put("status", delivery.status().name());
+        params.put("origin", delivery.origin().name());
+        params.put("replayed_from", delivery.replayedFrom().orElse(null));
+        params.put("attempt_count", delivery.attemptCount());
+        params.put("next_attempt_at", delivery.nextAttemptAt()
+                .map(i -> OffsetDateTime.ofInstant(i, ZoneOffset.UTC)).orElse(null));
+        params.put("last_error", delivery.lastError().orElse(null));
+        params.put("delivered_at", delivery.deliveredAt()
+                .map(i -> OffsetDateTime.ofInstant(i, ZoneOffset.UTC)).orElse(null));
+        // event_created_at: bound from the aggregate, never from now() (ADR-003 Amendment A4)
+        params.put("event_created_at", OffsetDateTime.ofInstant(delivery.eventCreatedAt(), ZoneOffset.UTC));
+        params.put("trace_context", delivery.traceContext().orElse(null));
+
+        return jdbcTemplate.queryForObject(sql, params, insertRowMapper());
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>No {@code client_id} predicate, deliberately. This is the worker's load of the row it
+     * just claimed (ADR-002 §2.2 steps 5-6) and it runs with no principal. The unscoped read is
+     * safe because this method lives on {@link DeliveryPipelineRepositoryPort}, which no
+     * client-facing use case injects; the tenant-scoped read lives on
+     * {@link com.cobre.challenge.application.port.out.persistence.DeliveryQueryRepositoryPort}
+     * and is the one a client-facing use case holds (ADR-007 Amendment E1).
+     */
+    @Override
+    public Optional<Delivery> findById(UUID deliveryId) {
+        String sql =
+                "SELECT delivery_id, event_id, subscription_id, client_id, status, origin,"
+                        + " replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
+                        + " event_created_at, trace_context"
+                        + " FROM deliveries WHERE delivery_id = :id";
+
+        List<Delivery> results = jdbcTemplate.query(
+                sql, new MapSqlParameterSource("id", deliveryId), insertRowMapper());
+        return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-004-07: claimForProcessing (correctness-critical)
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>ADR-002 §2.2 step 1.</strong> This is the single mechanism preventing a double
+     * POST (ADR-003 Q3 resolution). The guard {@code status = 'QUEUED'} is not a convenience
+     * check; the {@code QUEUED} precondition <em>is</em> the operation.
+     *
+     * <p>Zero rows affected returns {@code false} — not an exception, not an error log. It is the
+     * <em>designed</em> outcome for a redelivered SQS message (ADR-002 §2.2 step 2 follows with
+     * {@code DeleteMessage}). Throwing here would turn a benign duplicate into a crash loop at
+     * {@code maxReceiveCount = 3} and push a healthy delivery to the DLQ (A10).
+     */
+    @Override
+    public boolean claimForProcessing(UUID deliveryId, Instant now) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET status = 'PROCESSING'::delivery_status,"
+                        + "     updated_at = :now"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status = 'QUEUED'::delivery_status";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-004-09: four outcome writes
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Guard: {@code status = 'PROCESSING'}. Uses {@code deliveredAt} for both
+     * {@code delivered_at} and {@code updated_at} — one instant, one attempt outcome.
+     * {@code event_created_at} is not touched (ADR-003 Amendment A4's immutability rule).
+     */
+    @Override
+    public boolean markDelivered(UUID deliveryId, Instant deliveredAt) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET status = 'DELIVERED'::delivery_status,"
+                        + "     delivered_at = :delivered_at,"
+                        + "     next_attempt_at = NULL,"
+                        + "     updated_at = :delivered_at"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status = 'PROCESSING'::delivery_status";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("delivered_at", OffsetDateTime.ofInstant(deliveredAt, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Guard: {@code status = 'PROCESSING'}. {@code attempt_count} increments in SQL
+     * ({@code attempt_count + 1}), never from a value the caller read first — two writers
+     * could otherwise land the same count.
+     * {@code event_created_at} is not touched (ADR-003 Amendment A4's immutability rule).
+     */
+    @Override
+    public boolean scheduleRetry(UUID deliveryId, Instant nextAttemptAt, String lastError, Instant now) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET status = 'RETRYING'::delivery_status,"
+                        + "     attempt_count = attempt_count + 1,"
+                        + "     next_attempt_at = :next_attempt_at,"
+                        + "     last_error = :last_error,"
+                        + "     updated_at = :now"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status = 'PROCESSING'::delivery_status";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("next_attempt_at", OffsetDateTime.ofInstant(nextAttemptAt, ZoneOffset.UTC))
+                .addValue("last_error", lastError)
+                .addValue("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Guard: {@code status = 'PROCESSING'}. {@code next_attempt_at = NULL} is required:
+     * a terminal row with a non-null {@code next_attempt_at} would remain visible to the
+     * due-query's partial index and leak into every relay poll.
+     * {@code event_created_at} is not touched (ADR-003 Amendment A4's immutability rule).
+     */
+    @Override
+    public boolean markDead(UUID deliveryId, String lastError, Instant now) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET status = 'DEAD'::delivery_status,"
+                        + "     next_attempt_at = NULL,"
+                        + "     last_error = :last_error,"
+                        + "     updated_at = :now"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status = 'PROCESSING'::delivery_status";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("last_error", lastError)
+                .addValue("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Guard: {@code status IN ('QUEUED', 'PROCESSING')}. A DLQ message arrives without
+     * knowing which prior state the row is in (ADR-003 §1's machine admits both
+     * {@code QUEUED -> FAILED} and {@code PROCESSING -> FAILED}). Terminal states
+     * ({@code DELIVERED}, {@code DEAD}, {@code FAILED}) are excluded so a late DLQ message
+     * cannot overwrite a row that already reached a terminal state.
+     * {@code event_created_at} is not touched (ADR-003 Amendment A4's immutability rule).
+     */
+    @Override
+    public boolean markFailed(UUID deliveryId, String lastError, Instant now) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET status = 'FAILED'::delivery_status,"
+                        + "     last_error = :last_error,"
+                        + "     updated_at = :now"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status IN ('QUEUED'::delivery_status, 'PROCESSING'::delivery_status)";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("last_error", lastError)
+                .addValue("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-004-10: deferDelivery
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>ADR-002 §2.2 steps 3-4.</strong> No attempt occurred.
+     * <ul>
+     *   <li><strong>Must not</strong> increment {@code attempt_count} — a deferral that consumed
+     *       retry budget would burn ADR-004 §1's six-step schedule on attempts that never happened.
+     *   <li><strong>Must not</strong> write {@code last_error} — there was no error; there was no
+     *       request.
+     *   <li><strong>Must not</strong> insert a {@code delivery_attempts} row — ADR-003 §3's attempt
+     *       history must contain attempts, and a deferral would pollute the audit trail.
+     * </ul>
+     *
+     * <p>{@code updated_at} comes from the database's {@code now()} because this method's arity
+     * is fixed at two parameters (no caller {@code Instant}). This is a deliberate inconsistency
+     * with the rest of the port, logged in {@code docs/concerns.md}.
+     */
+    @Override
+    public boolean deferDelivery(UUID deliveryId, Instant nextAttemptAt) {
+        String sql =
+                "UPDATE deliveries"
+                        + " SET next_attempt_at = :next_attempt_at,"
+                        + "     updated_at = now()"
+                        + " WHERE delivery_id = :delivery_id"
+                        + "   AND status = 'QUEUED'::delivery_status";
+
+        int rows = jdbcTemplate.update(sql, new MapSqlParameterSource()
+                .addValue("delivery_id", deliveryId)
+                .addValue("next_attempt_at", OffsetDateTime.ofInstant(nextAttemptAt, ZoneOffset.UTC)));
+        return rows == 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-004-11: claimDue (correctness-critical)
+    // -----------------------------------------------------------------------
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>ADR-002 §2.1.</strong> Selects due deliveries and, in the same caller transaction,
+     * promotes them to {@code QUEUED} and pushes {@code next_attempt_at} forward by 5 minutes.
+     *
+     * <p><strong>Requires an active transaction.</strong> {@code SKIP LOCKED} outside a
+     * transaction acquires no lasting locks — every relay instance would claim the same batch and
+     * the whole design silently double-sends. This method asserts
+     * {@link TransactionSynchronizationManager#isActualTransactionActive()} before executing any
+     * SQL and throws {@link IllegalStateException} if false (A10 fail-closed).
+     * {@code @Transactional} is deliberately <em>not</em> added to this class; the assertion
+     * exists precisely to catch a caller that forgot its own transaction.
+     *
+     * <p><strong>{@code FOR UPDATE OF d SKIP LOCKED}.</strong> The {@code OF d} clause locks only
+     * the {@code deliveries} rows. A bare {@code FOR UPDATE ... SKIP LOCKED} would also lock the
+     * joined {@code subscriptions} row, causing two relay instances working on different
+     * deliveries of the same busy subscription to skip each other's rows and silently under-claim.
+     * {@code OF d} is load-bearing. ADR-002 §2.1's text writes the bare form; this refinement is
+     * intentional and implements §2.1's stated intent ("each takes a disjoint batch" of
+     * <em>deliveries</em>).
+     *
+     * <p>{@code asOf} replaces every {@code now()} in all six predicates so a single poll cycle
+     * evaluates the grace window and cooldown against one consistent instant.
+     *
+     * <p>Interval arithmetic stays in SQL; the 30s/60s grace windows are SQL literals so a
+     * reviewer can diff them line-by-line against ADR-002 §2.1.
+     *
+     * <p>Returns an empty list if no rows are due (Effective Java Item 54).
+     */
+    @Override
+    public List<Delivery> claimDue(int batchLimit, Instant asOf) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException(
+                    "claimDue must be called within an active transaction. "
+                            + "SKIP LOCKED outside a transaction takes no lasting locks and "
+                            + "every caller would claim the same batch (A10 fail-closed).");
+        }
+        if (batchLimit <= 0) {
+            throw new IllegalArgumentException("batchLimit must be positive, was " + batchLimit);
+        }
+
+        // One compound statement: SELECT with SKIP LOCKED inside a CTE, UPDATE in a second CTE,
+        // RETURNING the updated rows. Both CTEs share the same snapshot and transaction.
+        //
+        // The six WHERE predicates reproduce ADR-002 §2.1 verbatim, with :as_of replacing now():
+        //   1. status IN (PENDING, RETRYING, QUEUED, PROCESSING)
+        //   2. next_attempt_at <= :as_of
+        //   3. PENDING grace: d.created_at < :as_of - 30s
+        //   4. PROCESSING staleness: d.updated_at < :as_of - 60s (crashed-worker reclaim)
+        //   5. Circuit cooldown: circuit_opened_at < :as_of - circuit_backoff (elapsed => probe)
+        //   6. Throttle: throttled_until is null or past
+        String sql =
+                "WITH claimed AS ("
+                        + "  SELECT d.delivery_id"
+                        + "  FROM deliveries d"
+                        + "  JOIN subscriptions s ON s.subscription_id = d.subscription_id"
+                        + "  WHERE d.status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING')"
+                        + "    AND d.next_attempt_at <= :as_of"
+                        + "    AND (d.status <> 'PENDING'    OR d.created_at < :as_of - interval '30 seconds')"
+                        + "    AND (d.status <> 'PROCESSING' OR d.updated_at < :as_of - interval '60 seconds')"
+                        + "    AND (s.circuit_state <> 'OPEN' OR s.circuit_opened_at < :as_of - s.circuit_backoff)"
+                        + "    AND (s.throttled_until IS NULL OR s.throttled_until <= :as_of)"
+                        + "  ORDER BY d.next_attempt_at"
+                        + "  LIMIT :batch_limit"
+                        + "  FOR UPDATE OF d SKIP LOCKED"
+                        + "),"
+                        + "updated AS ("
+                        + "  UPDATE deliveries"
+                        + "     SET status          = 'QUEUED'::delivery_status,"
+                        + "         next_attempt_at = :as_of + interval '" + CLAIM_DUE_PUSH_INTERVAL + "',"
+                        + "         updated_at      = :as_of"
+                        + "   WHERE delivery_id IN (SELECT delivery_id FROM claimed)"
+                        + "   RETURNING "
+                        + "     delivery_id, event_id, subscription_id, client_id, status, origin,"
+                        + "     replayed_from, attempt_count, next_attempt_at, last_error,"
+                        + "     delivered_at, event_created_at, trace_context"
+                        + ")"
+                        + "SELECT delivery_id, event_id, subscription_id, client_id, status, origin,"
+                        + "     replayed_from, attempt_count, next_attempt_at, last_error,"
+                        + "     delivered_at, event_created_at, trace_context"
+                        + " FROM updated";
+
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("as_of", OffsetDateTime.ofInstant(asOf, ZoneOffset.UTC))
+                .addValue("batch_limit", batchLimit);
+
+        List<Delivery> result = jdbcTemplate.query(sql, params, insertRowMapper());
+        return result == null ? Collections.emptyList() : result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /**
+     * A row mapper that reads columns without the {@code d.} alias prefix, used for
+     * INSERT ... RETURNING and for findById (single-table SELECT).
+     */
+    private org.springframework.jdbc.core.RowMapper<Delivery> insertRowMapper() {
+        return deliveryRowMapper;
+    }
+}

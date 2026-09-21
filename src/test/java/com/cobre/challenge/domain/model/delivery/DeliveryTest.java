@@ -13,11 +13,15 @@ import org.junit.jupiter.api.Test;
 
 class DeliveryTest {
 
+    private static final Instant EVENT_CREATED_AT = Instant.parse("2026-01-01T00:00:00Z");
+    private static final Optional<String> TRACE_CONTEXT = Optional.of("00-abc-def-01");
+
     private Delivery pending() {
         return new Delivery(
                 UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
                 DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
-                0, Optional.empty(), Optional.empty(), Optional.empty());
+                0, Optional.empty(), Optional.empty(), Optional.empty(),
+                EVENT_CREATED_AT, TRACE_CONTEXT);
     }
 
     @Test
@@ -25,8 +29,31 @@ class DeliveryTest {
         assertThatThrownBy(() -> new Delivery(
                 null, "EVT001", UUID.randomUUID(), "client-1",
                 DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
-                0, Optional.empty(), Optional.empty(), Optional.empty()))
+                0, Optional.empty(), Optional.empty(), Optional.empty(),
+                EVENT_CREATED_AT, TRACE_CONTEXT))
                 .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void compactConstructorRejectsNullEventCreatedAt() {
+        assertThatThrownBy(() -> new Delivery(
+                UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
+                DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
+                0, Optional.empty(), Optional.empty(), Optional.empty(),
+                null, TRACE_CONTEXT))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("eventCreatedAt");
+    }
+
+    @Test
+    void compactConstructorRejectsNullTraceContext() {
+        assertThatThrownBy(() -> new Delivery(
+                UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
+                DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
+                0, Optional.empty(), Optional.empty(), Optional.empty(),
+                EVENT_CREATED_AT, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("use Optional.empty()");
     }
 
     @Test
@@ -34,7 +61,8 @@ class DeliveryTest {
         assertThatThrownBy(() -> new Delivery(
                 UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
                 DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
-                -1, Optional.empty(), Optional.empty(), Optional.empty()))
+                -1, Optional.empty(), Optional.empty(), Optional.empty(),
+                EVENT_CREATED_AT, TRACE_CONTEXT))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -43,7 +71,8 @@ class DeliveryTest {
         assertThatThrownBy(() -> new Delivery(
                 UUID.randomUUID(), "EVT001", UUID.randomUUID(), "client-1",
                 DeliveryStatus.PENDING, DeliveryOrigin.INGEST, Optional.empty(),
-                0, Optional.empty(), Optional.empty(), Optional.of(Instant.now())))
+                0, Optional.empty(), Optional.empty(), Optional.of(Instant.now()),
+                EVENT_CREATED_AT, TRACE_CONTEXT))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -54,6 +83,15 @@ class DeliveryTest {
 
         assertThat(queued.status()).isEqualTo(DeliveryStatus.QUEUED);
         assertThat(pending.status()).isEqualTo(DeliveryStatus.PENDING);
+    }
+
+    @Test
+    void transitionToPreservesEventCreatedAtAndTraceContext() {
+        Delivery pending = pending();
+        Delivery queued = pending.transitionTo(DeliveryStatus.QUEUED);
+
+        assertThat(queued.eventCreatedAt()).isEqualTo(EVENT_CREATED_AT);
+        assertThat(queued.traceContext()).isEqualTo(TRACE_CONTEXT);
     }
 
     @Test
@@ -79,6 +117,18 @@ class DeliveryTest {
     }
 
     @Test
+    void markDeliveredPreservesEventCreatedAtAndTraceContext() {
+        Delivery processing = pending()
+                .transitionTo(DeliveryStatus.QUEUED)
+                .transitionTo(DeliveryStatus.PROCESSING);
+
+        Delivery delivered = processing.markDelivered(Instant.now());
+
+        assertThat(delivered.eventCreatedAt()).isEqualTo(EVENT_CREATED_AT);
+        assertThat(delivered.traceContext()).isEqualTo(TRACE_CONTEXT);
+    }
+
+    @Test
     void markDeliveredThrowsFromIllegalSourceState() {
         Delivery pending = pending();
         assertThatThrownBy(() -> pending.markDelivered(Instant.now()))
@@ -101,6 +151,18 @@ class DeliveryTest {
     }
 
     @Test
+    void markRetryingPreservesEventCreatedAtAndTraceContext() {
+        Delivery processing = pending()
+                .transitionTo(DeliveryStatus.QUEUED)
+                .transitionTo(DeliveryStatus.PROCESSING);
+
+        Delivery retrying = processing.markRetrying(Instant.now().plusSeconds(5), "err");
+
+        assertThat(retrying.eventCreatedAt()).isEqualTo(EVENT_CREATED_AT);
+        assertThat(retrying.traceContext()).isEqualTo(TRACE_CONTEXT);
+    }
+
+    @Test
     void markRetryingThrowsFromIllegalSourceState() {
         Delivery pending = pending();
         assertThatThrownBy(() -> pending.markRetrying(Instant.now(), "err"))
@@ -119,6 +181,18 @@ class DeliveryTest {
         assertThat(dead.nextAttemptAt()).isEmpty();
         assertThat(dead.lastError()).contains("404");
         assertThat(dead.attemptCount()).isEqualTo(processing.attemptCount());
+    }
+
+    @Test
+    void markDeadPreservesEventCreatedAtAndTraceContext() {
+        Delivery processing = pending()
+                .transitionTo(DeliveryStatus.QUEUED)
+                .transitionTo(DeliveryStatus.PROCESSING);
+
+        Delivery dead = processing.markDead("err");
+
+        assertThat(dead.eventCreatedAt()).isEqualTo(EVENT_CREATED_AT);
+        assertThat(dead.traceContext()).isEqualTo(TRACE_CONTEXT);
     }
 
     @Test

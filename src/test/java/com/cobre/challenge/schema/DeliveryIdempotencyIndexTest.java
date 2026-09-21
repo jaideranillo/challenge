@@ -56,9 +56,11 @@ class DeliveryIdempotencyIndexTest {
     }
 
     private void insertDelivery(UUID deliveryId, String eventId, UUID subscriptionId, String clientId, String status) {
+        // event_created_at is NOT NULL (V4 migration); we supply now() here because
+        // this test exercises the idempotency index, not the timestamp value.
         jdbcTemplate.update(
-                "INSERT INTO deliveries (delivery_id, event_id, subscription_id, client_id, status) "
-                        + "VALUES (?, ?, ?, ?, ?::delivery_status)",
+                "INSERT INTO deliveries (delivery_id, event_id, subscription_id, client_id, status, event_created_at) "
+                        + "VALUES (?, ?, ?, ?, ?::delivery_status, now())",
                 deliveryId, eventId, subscriptionId, clientId, status);
     }
 

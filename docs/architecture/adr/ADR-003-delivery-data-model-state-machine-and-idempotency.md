@@ -78,6 +78,8 @@ The `circuit_state` referenced by ADR-002 §2.1's due-query and ADR-002 §2.2's 
 
 Every writer above changes exactly one row's status via a conditional `UPDATE ... WHERE status = <expected prior state>` (or is an `INSERT`); this is the state-guard pattern from ADR-001 §1 applied uniformly, and it is what makes concurrent workers, relay instances, and a racing sweeper all safe without a lock service.
 
+> **Amendment A1 (2026-09-20, Tech Lead directive).** Each row of the table above is now a **named, intent-revealing port operation** rather than a generic status transition, and each carries the companion columns that row already required. See `## Amendments` at the end of this ADR for the operation-to-row mapping. The state-guard property stated in the paragraph above is unchanged: every one of those operations is still exactly one conditional `UPDATE` guarded on the expected prior state.
+
 **Public naming:** the sample file uses `delivery_status` values `completed` and `failed`. The API exposes a stable public vocabulary and maps internal states to it in the controller's mapping step (never leaking the domain enum):
 
 | Internal state | Public `delivery_status` |
@@ -168,7 +170,7 @@ erDiagram
   }
 ```
 
-**`notification_events`** — immutable, append-only record of what the platform emitted. `event_id` is the platform's id (matches the sample file's `event_id`, e.g. `EVT001`). `created_at` is the event-creation timestamp the API's date-range filter runs against. Never updated after insert.
+**`notification_events`** — immutable, append-only record of what the platform emitted. `event_id` is the platform's id (matches the sample file's `event_id`, e.g. `EVT001`). `created_at` is the event-creation timestamp the API's date-range filter runs against. Never updated after insert. **Amendment A4 (2026-09-20):** the filter still runs against this *value*, but reads it from its denormalized copy `deliveries.event_created_at` rather than joining this table, which is what makes it index-servable alongside the keyset tiebreak. This table stays the origin of the value; the copy is written at delivery insert and never updated.
 
 **`subscriptions`** — the delivery contract with a client, and now also the home of circuit-breaker and throttle state, reused rather than a separate Redis-backed store: the relay already scans `deliveries` and joins `subscriptions` on every claim cycle, so this state is one join away with no extra round trip, no extra moving part, no cache-invalidation problem.
 - `event_types` (array) replaces a `unique(client_id, event_type)` design: one subscription row per client, covering N event types, rather than one row per `(client_id, event_type)` pair. Resolves Q9's shape (Q9 in `docs/architecture-overview.md`; subscription CRUD API itself still out of scope for this ADR).
@@ -190,7 +192,8 @@ erDiagram
 - `circuit_backoff` (on `subscriptions`, not `deliveries`) is the interval written at trip time alongside `circuit_opened_at`; rationale in ADR-006 §1.2.
 - `last_error` is a single denormalized field (HTTP status or error class, whichever applies) snapshotting the most recent attempt, so `GET /notification_events` doesn't need to join `delivery_attempts` for its common case; the full history is still in the child table.
 - `delivered_at` is set once, on the `DELIVERED` transition — the terminal-success timestamp, distinct from `updated_at`.
-- `trace_context` persists the W3C `traceparent` (ADR-002 §3) so the consumer can restore the original trace regardless of which process attempts delivery.
+- `trace_context` persists the W3C `traceparent` (ADR-002 §3) so the consumer can restore the original trace regardless of which process attempts delivery. **Amendment A3 (2026-09-20):** this column is written by the delivery insert and returned by the pipeline port's row load, and `traceContext` is therefore a component of the `Delivery` domain record rather than an adapter-only column. See `## Amendments`.
+- **`event_created_at` (Amendment A4, 2026-09-20): the denormalized copy of `notification_events.created_at`,** written once at insert and never updated. This is the column the self-service list endpoint's date-range filter and keyset ordering run against (ADR-005 §1), *not* `deliveries.created_at`. The two differ by design for a `REPLAY` or `RECOVERED` row: `created_at` is when the replay was requested, `event_created_at` is when the platform event actually happened, and a client filtering "show me deliveries for events in this window" means the latter. See `## Amendments`.
 - No `replay_count`/`last_replayed_at`: replay (ADR-005 §1) and recovery (§1.1, ADR-004 §1) don't touch the original row at all, so there is nothing on it to reset or stamp. "How many times has this event been replayed or recovered" is answerable by counting rows with a given `replayed_from` chain, not by a counter column.
 
 Indexes (contract-level, exact definitions belong to the DBA task):
@@ -198,7 +201,7 @@ Indexes (contract-level, exact definitions belong to the DBA task):
 - Partial unique index on `(event_id, subscription_id) WHERE status NOT IN ('DELIVERED', 'DEAD', 'FAILED')` — the idempotency/anti-double-replay guard (§2, ADR-005 §1).
 - Index on `(subscription_id, status)` for the per-subscription in-flight count the bulkhead/`max_concurrency` check needs (§3, ADR-006 §1) — this was missing from the original index list.
 - Index on `replayed_from` for chaining a replay's or recovery's history back to its original.
-- Index on `(client_id, created_at)` for the list endpoint's default ordering and date-range filter, keyset-paginated (ADR-005 §1).
+- Index on `(client_id, event_created_at)` for the list endpoint's default ordering and date-range filter, keyset-paginated (ADR-005 §1). **Amendment A4 (2026-09-20):** this supersedes the original `(client_id, created_at)` form. The keyset is `(event_created_at, delivery_id)`, so the index must be on the same column the filter and the ordering use.
 - Index on `(client_id, status)` for the `delivery_status` filter.
 
 **Partitioning: deferred, not implemented.** `deliveries` and `delivery_attempts` are plain (unpartitioned) tables. The whiteboard's date-partitioning note is recorded here as a **future performance/scalability improvement**, to be revisited once actual data volume or retention pressure justifies it — at the volumes this service is being built for, it is not needed, and it is not worth its cost today.
@@ -234,6 +237,59 @@ Carried from the master Q-list in `docs/architecture-overview.md`; these three a
 - **Q3 — "check nonce" in the consumer (resolved).** Resolved as the consumer-side idempotency check, and it is now fully specified rather than an interpretation: the state-guarded conditional claim `UPDATE deliveries SET status = 'PROCESSING' WHERE delivery_id = ? AND status = 'QUEUED'` (ADR-002 §2.2 step 1), with the zero-rows-affected path (delete the message, stop) spelled out in ADR-002 §2.2 step 2 and the general pattern stated in ADR-001 §1 and §1.1. That is the mechanism that guarantees a delivery is never double-sent, and it does the job a nonce would have done without a cryptographic construct. **Only open if the word meant something else:** a per-request nonce sent *to* the client for replay protection on their side is a different feature, changes the outbound payload contract, and belongs with the signing scheme (ADR-004 §2, flagged there as its own follow-up decision). Say so if that was the intent.
 - **Q4 — Public status vocabulary (resolved: the three-value superset).** The public `delivery_status` vocabulary is `pending` / `completed` / `failed`, mapped from the internal states exactly as §1.1's table states (`PENDING`/`QUEUED`/`PROCESSING`/`RETRYING` -> `pending`, `DELIVERED` -> `completed`, `DEAD`/`FAILED` -> `failed`). This is not an assumption layered on top of the sample file: it follows necessarily from the state machine the user supplied (§1) and its transitions. That machine has non-terminal states by construction — a delivery is committed before it is attempted, and retries are scheduled rather than immediate — so a delivery genuinely exists in an in-flight condition that is neither `completed` nor `failed`, and the list endpoint must be able to name it. The sample file shows only `completed` and `failed` because it shows only settled deliveries. The public vocabulary is therefore a strict superset of the sample's two values, and `pending` is a valid `delivery_status` filter value.
 
+## Amendments
+
+Post-acceptance corrections to this ADR's contract-level text, made on **Tech Lead directive of 2026-09-20** while reviewing the FEAT-004 persistence-adapter plan. Recorded in place rather than as a new ADR, because none of them reverses a decision this ADR made: each names something this ADR already specified but left unnamed, or fixes a column the design needed and did not have. This ADR's `Status` is unchanged and is not an agent's to change. Downstream work: `docs/features/FEAT-004-outbound-persistence-adapters/`.
+
+### A1. §1.1's write table is now a set of named, intent-revealing port operations
+
+The original contract exposed one generic `transitionStatus(deliveryId, expected, target, now)` per §1.1 row. That signature could write `status` and nothing else, so **every companion column §1.1's own table requires was inexpressible** (`attempt_count`, `next_attempt_at`, `last_error`, `delivered_at`). This was raised in `docs/concerns.md` during the FEAT-004 breakdown and is closed here rather than deferred.
+
+Each row of §1.1's table maps to exactly one operation on `DeliveryPipelineRepositoryPort` (A2). Every one is a single atomic conditional `UPDATE` guarded on the expected prior state, returning whether exactly one row was affected; **zero rows affected remains a normal outcome, never an exception** (ADR-002 §2.2 step 2).
+
+| §1.1 actor and row | Operation | Guard | Also writes |
+| --- | --- | --- | --- |
+| Gateway; `POST /replay`; internal recovery | `insert` | partial unique index (§2) | all columns incl. `trace_context` (A3) and `event_created_at` (A4) |
+| Relay: `PENDING`/`RETRYING` -> `QUEUED` | `claimDue` (batch, ADR-002 §2.1) | `FOR UPDATE SKIP LOCKED` | `next_attempt_at` pushed forward |
+| Worker (claim): `QUEUED` -> `PROCESSING` | `claimForProcessing` | `status = 'QUEUED'` | `updated_at` |
+| Worker (2xx): -> `DELIVERED` | `markDelivered` | `status = 'PROCESSING'` | `delivered_at`, `next_attempt_at = NULL` |
+| Worker (retryable failure): -> `RETRYING` | `scheduleRetry` | `status = 'PROCESSING'` | `attempt_count = attempt_count + 1`, `next_attempt_at`, `last_error` |
+| Worker (budget exhausted / non-retryable): -> `DEAD` | `markDead` | `status = 'PROCESSING'` | `next_attempt_at = NULL`, `last_error` |
+| DLQ consumer: -> `FAILED` | `markFailed` | `status IN ('QUEUED', 'PROCESSING')` | `last_error` |
+
+**`claimForProcessing` is an addition to the operation list the directive enumerated.** The directive named the outcome transitions and the deferral, but not the worker's claim. It cannot be dropped: it is §1.1's "Worker (claim)" row, ADR-002 §2.2 step 1, and this ADR's own Q3 resolution, and it is the single mechanism that guarantees a delivery is never double-sent. Named here so the set covers §1.1's table completely.
+
+**`markFailed` is the one operation guarded on a status *set* rather than a single expected state.** ADR-003 §1's state machine admits both `QUEUED -> FAILED` and `PROCESSING -> FAILED`, because a message can reach the DLQ from either, and the DLQ consumer does not know which. The guard is still a guard: it excludes the three terminal states, so a row that already reached `DELIVERED` can never be overwritten as `FAILED` by a late DLQ message.
+
+**`deferDelivery` is new and had no row in §1.1's table at all.** ADR-002 §2.2 steps 3 and 4 (bulkhead-timeout and open-circuit deferral) write `next_attempt_at = now() + 10-20s jittered` guarded on `status = 'QUEUED'`, and ADR-006 §1.1 makes that write the whole deferral mechanism in place of `ChangeMessageVisibility`. It is a write §1.1 never listed. Its defining property is what it must **not** do: no status change (the row stays `QUEUED`), **no `attempt_count` increment, no `last_error`, and no `delivery_attempts` row**, because no attempt occurred. ADR-002 §2.2 step 3 already says exactly this; the operation makes it enforceable instead of a prose constraint.
+
+### A2. `DeliveryRepositoryPort` is split along the tenant boundary
+
+One interface becomes two, which is ADR-007 §5.2's interface-segregation requirement finally applied to this port (the unapplied split was logged in `docs/concerns.md` during the FEAT-004 breakdown):
+
+- **`DeliveryPipelineRepositoryPort`** — cross-tenant, no `client_id` parameter on any method: `insert`, `findById(UUID)`, `claimForProcessing`, `markDelivered`, `scheduleRetry`, `markDead`, `markFailed`, `deferDelivery`, `claimDue`.
+- **`DeliveryQueryRepositoryPort`** — tenant mandatory on every method: `findById(UUID, String clientId)`, `findPage(String clientId, ...)`.
+
+`DeliveryAttemptRepositoryPort` and `SubscriptionRepositoryPort` are unaffected and remain single cross-tenant interfaces.
+
+**The pipeline port gains an unscoped `findById(UUID deliveryId)`, and that is deliberate.** ADR-007 §5.2 states "There is no `findById(DeliveryId)`. Not deprecated, not discouraged: absent." That statement governs the **client-facing** port and still holds there: `DeliveryQueryRepositoryPort` has no unscoped overload. The worker, however, must load the row it just claimed to reach `event_id`, `subscription_id`, the authoritative `attempt_count` and `trace_context` (ADR-002 §2.2 steps 5-6), and it runs with no principal. ADR-007 §5.2's own carve-out covers this: internal pipeline ports "are cross-tenant by design and take no `TenantId`". The split is what makes the distinction visible in the type system instead of resting on a comment. See ADR-007's own `## Amendments`.
+
+### A3. `trace_context` is a `Delivery` component, not an adapter-only column
+
+§3 listed `trace_context` alongside `created_at`/`updated_at`, and the FEAT-003 `Delivery` record treated all three as persistence-only. That grouping was wrong for this one column: `created_at` and `updated_at` are audit metadata no use case reads, whereas `trace_context` is **written by one use case and read by another** (ADR-002 §3.1: the consumer falls back to the persisted column when the SQS message attribute is absent). A value the application layer both writes and reads belongs in the aggregate.
+
+`Delivery` therefore gains `Optional<String> traceContext`. The insert writes it and the pipeline port's `findById` returns it, so no extra port parameter is needed. `created_at` and `updated_at` stay out of the domain record, unchanged.
+
+### A4. `event_created_at` is denormalized onto `deliveries`
+
+`deliveries` gains `event_created_at timestamptz NOT NULL`, copied from `notification_events.created_at` at insert and **never updated**. The list endpoint's date-range filter and keyset ordering move onto it, and the index becomes `(client_id, event_created_at)`.
+
+This resolves a self-contradiction in the original §3, logged in `docs/concerns.md` during the FEAT-004 breakdown: §3's `notification_events` paragraph said the API's date filter runs against `notification_events.created_at`, while §3's index list created `(client_id, created_at)` on `deliveries`, and ADR-005 §1 specified a keyset on `(created_at, id)`. Those were two different columns. FEAT-004's first pass chose `deliveries.created_at` on index-servability grounds, which contradicted ADR-005 §1's "filters by **event creation date range**".
+
+Denormalization gets both properties at once, and the correctness argument is the decisive one: for a `REPLAY` or `RECOVERED` row, `deliveries.created_at` is when the replay was requested, which is **not** when the event happened. A client asking for deliveries of events in a date window would silently miss replayed rows, or see them filed under the wrong day. The filter must key on the event's timestamp, and a keyset must order on the same table as its tiebreak (`delivery_id`) to be index-servable, so the value has to be on `deliveries`.
+
+Immutability is an adapter and test property, not a trigger. No `UPDATE` in the design touches the column, and FEAT-004 asserts that. A database-level immutability trigger is deliberately not added, consistent with §3's existing rejection of triggers for the idempotency invariant.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments A1-A4 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.
