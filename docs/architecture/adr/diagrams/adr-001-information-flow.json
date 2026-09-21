@@ -197,7 +197,7 @@
       "label": "INSERT event + content (1 txn)",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelDy": -10
+      "labelAt": [340, 270]
     },
     {
       "from": "event_gateway",
@@ -205,14 +205,17 @@
       "label": "INSERT N rows PENDING (same txn)",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelDy": 12
+      "via": [[485, 393], [627.5, 393]],
+      "labelAt": [530, 320]
     },
     {
       "from": "event_gateway",
       "to": "subscriptions",
       "label": "READ active subscription (tenant-scoped)",
-      "route": "straight",
-      "labelAt": [700, 280]
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [[560, 75], [777, 75], [777, 400], [822.5, 400]],
+      "labelAt": [700, 75]
     },
     {
       "from": "event_gateway",
@@ -225,7 +228,9 @@
       "to": "deliveries",
       "label": "UPDATE -> QUEUED (SKIP LOCKED claim)",
       "fromSide": "bottom",
-      "toSide": "top"
+      "toSide": "top",
+      "via": [[680, 428], [627.5, 428]],
+      "labelAt": [600, 340]
     },
     {
       "from": "relay",
@@ -258,21 +263,25 @@
       "label": "INSERT per HTTP attempt",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelDy": -10
+      "labelAt": [1100, 320]
     },
     {
       "from": "delivery_worker",
       "to": "deliveries",
       "label": "UPDATE QUEUED->PROCESSING->DELIVERED/RETRYING/DEAD",
-      "route": "straight",
-      "labelAt": [900, 280]
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[1070, 408], [627.5, 408]],
+      "labelAt": [850, 408]
     },
     {
       "from": "delivery_worker",
       "to": "subscriptions",
       "label": "READ URL+secret; UPDATE on 404/410/429",
-      "route": "straight",
-      "labelAt": [900, 380]
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[1070, 402], [822.5, 402]],
+      "labelAt": [950, 424]
     },
     {
       "from": "sqs",
@@ -294,7 +303,8 @@
       "to": "deliveries",
       "label": "UPDATE -> FAILED (sole writer)",
       "fromSide": "bottom",
-      "toSide": "top"
+      "toSide": "top",
+      "labelAt": [800, 470]
     },
     {
       "from": "api_client",
@@ -307,14 +317,14 @@
       "to": "filter_chain",
       "label": "TLS + rate limit",
       "variant": "security",
-      "labelAt": [400, 534]
+      "labelDy": -45
     },
     {
       "from": "filter_chain",
       "to": "self_service_api",
       "label": "TenantId (mandatory)",
       "variant": "security",
-      "labelAt": [560, 540]
+      "labelDy": -45
     },
     {
       "from": "self_service_api",
@@ -322,28 +332,26 @@
       "label": "READ (full attempt history)",
       "fromSide": "top",
       "toSide": "bottom",
-      "labelDy": -10
+      "via": [[985, 552], [1017.5, 552]],
+      "labelAt": [1060, 552]
     },
     {
       "from": "self_service_api",
       "to": "deliveries",
-      "label": "GET list/single (READ)",
-      "route": "straight",
-      "labelAt": [780, 555]
-    },
-    {
-      "from": "self_service_api",
-      "to": "deliveries",
-      "label": "POST /replay -> INSERT new row",
-      "route": "straight",
-      "labelAt": [780, 500]
+      "label": "GET (READ) / POST /replay -> INSERT new row",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [[820, 590], [820, 540], [627.5, 540]],
+      "labelAt": [740, 540]
     },
     {
       "from": "self_service_api",
       "to": "notification_events",
       "label": "READ (joined for event body)",
-      "route": "straight",
-      "labelAt": [630, 555]
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [[800, 590], [800, 533], [432.5, 533]],
+      "labelAt": [560, 533]
     }
   ],
   "cards": [

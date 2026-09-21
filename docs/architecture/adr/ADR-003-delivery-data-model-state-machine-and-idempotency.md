@@ -290,6 +290,30 @@ Denormalization gets both properties at once, and the correctness argument is th
 
 Immutability is an adapter and test property, not a trigger. No `UPDATE` in the design touches the column, and FEAT-004 asserts that. A database-level immutability trigger is deliberately not added, consistent with §3's existing rejection of triggers for the idempotency invariant.
 
+### A5. `notification_events` gains an outbound port, and §2's idempotency outcome gains a return signal
+
+Made on **Tech Lead directive of 2026-09-20** while planning FEAT-005 (the ingest use case). Two gaps, both contract-level, both found by trying to express §2 against the ports as committed. Neither reverses a decision; each names a return value §2 already described in prose but no signature carried.
+
+**Gap 1: no port writes `notification_events`.** §1.1's first row and ADR-002 §1.1 step 3 both require the gateway to insert the event row in the same transaction as the fan-out, with `ON CONFLICT (event_id) DO NOTHING` (the `PRIMARY KEY` on `event_id` is what makes it idempotent, as `V1`'s own column comment states). FEAT-003 defined ports for `deliveries`, `delivery_attempts` and `subscriptions`, and none for `notification_events`. The table was reachable from no use case.
+
+`NotificationEventRepositoryPort` is added to `application/port/out/persistence`, cross-tenant like the other pipeline-side ports (the gateway holds the producer's IAM principal, not a client principal; ADR-007 §5.2's carve-out and Amendment E1 cover it):
+
+| Method | Semantics |
+| --- | --- |
+| `boolean insertIfAbsent(NotificationEvent event)` | `INSERT ... ON CONFLICT (event_id) DO NOTHING`. Returns `true` when this call inserted the row, `false` when the event was already stored. A `false` is a normal outcome, never an exception. |
+| `Optional<NotificationEvent> findById(String eventId)` | Reads the stored event. The ingest use case needs the **stored** `created_at`, not the command's, to denormalize into `deliveries.event_created_at` (A4) on a re-ingest, so the two rows can never disagree about when the event happened. |
+
+**Gap 2: `insert` cannot express §2's "treats that as success".** §2 says the partial unique index violation on `(event_id, subscription_id)` where the status is non-terminal "is treated as success (returning the existing delivery) rather than an error". `DeliveryPipelineRepositoryPort.insert(Delivery)` returns `Delivery` and can only signal the conflict by throwing, which is precisely what §2 forbids the use case from surfacing. Two methods are added to that port:
+
+| Method | Semantics |
+| --- | --- |
+| `Optional<Delivery> insertIfAbsent(Delivery delivery)` | `INSERT ... ON CONFLICT (event_id, subscription_id) WHERE status NOT IN ('DELIVERED','DEAD','FAILED') DO NOTHING RETURNING *`. The inference clause must repeat `idx_deliveries_live_pair`'s predicate verbatim (`V2`), or Postgres cannot infer the partial index. `Optional.empty()` means a live row for the pair already exists — the idempotent-replay outcome, not a failure. |
+| `Optional<Delivery> findLiveByEventAndSubscription(String eventId, UUID subscriptionId)` | The read that turns that `empty()` into §2's "returning the existing delivery". Predicate identical to the partial index's, so it returns at most one row. |
+
+`insert(Delivery)` is **kept, unchanged**, for `POST /replay` and internal recovery (ADR-005 §1), which must fail loudly if the pair is still live rather than silently returning someone else's row. Ingest is the only caller that wants the conflict swallowed, so it is the only one that gets a different method. Collapsing the two into one method with a flag would put that decision at a call site instead of in the type.
+
+**Zero matching subscriptions is unchanged and is not an error.** §2 already says the event is recorded and no `deliveries` row is written. Stated here only because it is the one ingest outcome with an empty result and a `202`, and FEAT-005 tests it explicitly.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments A1-A4 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments A1-A4 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`; Amendment A5 by `docs/features/FEAT-005-event-ingest-use-case/`.

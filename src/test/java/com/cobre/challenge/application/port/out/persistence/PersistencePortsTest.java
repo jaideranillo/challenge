@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPage;
 import com.cobre.challenge.domain.model.delivery.Delivery;
+import com.cobre.challenge.domain.model.event.NotificationEvent;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.List;
@@ -105,6 +106,27 @@ class PersistencePortsTest {
         }
     }
 
+    // --- idempotency-conflict return signal (TASK-005-04) ---
+
+    @Test
+    void insertIfAbsentReturnsOptionalOfDelivery() throws NoSuchMethodException {
+        Method m = DeliveryPipelineRepositoryPort.class.getDeclaredMethod("insertIfAbsent", Delivery.class);
+        assertThat(m.getReturnType()).isEqualTo(Optional.class);
+    }
+
+    @Test
+    void findLiveByEventAndSubscriptionReturnsOptionalOfDelivery() throws NoSuchMethodException {
+        Method m = DeliveryPipelineRepositoryPort.class.getDeclaredMethod(
+                "findLiveByEventAndSubscription", String.class, java.util.UUID.class);
+        assertThat(m.getReturnType()).isEqualTo(Optional.class);
+    }
+
+    @Test
+    void insertIsStillPresentAndUnchanged() throws NoSuchMethodException {
+        Method m = DeliveryPipelineRepositoryPort.class.getDeclaredMethod("insert", Delivery.class);
+        assertThat(m.getReturnType()).isEqualTo(Delivery.class);
+    }
+
     // --- subscription circuit ops shape (TASK-004-04) ---
 
     @Test
@@ -161,6 +183,52 @@ class PersistencePortsTest {
     @Test
     void subscriptionRepositoryPortImportsNoFrameworkType() {
         for (Method m : SubscriptionRepositoryPort.class.getDeclaredMethods()) {
+            assertNoSpringType(m);
+        }
+    }
+
+    // --- notification event repository port shape (TASK-005-03) ---
+
+    @Test
+    void notificationEventRepositoryPortIsAnInterface() {
+        assertThat(NotificationEventRepositoryPort.class.isInterface()).isTrue();
+    }
+
+    @Test
+    void notificationEventRepositoryPortHasExactlyTwoMethods() {
+        assertThat(NotificationEventRepositoryPort.class.getDeclaredMethods()).hasSize(2);
+    }
+
+    @Test
+    void insertIfAbsentReturnsBooleanAndTakesNotificationEvent() throws NoSuchMethodException {
+        Method method = NotificationEventRepositoryPort.class.getDeclaredMethod(
+                "insertIfAbsent", NotificationEvent.class);
+
+        assertThat(method.getReturnType()).isEqualTo(boolean.class);
+    }
+
+    @Test
+    void findByIdReturnsOptionalAndTakesEventIdString() throws NoSuchMethodException {
+        Method method = NotificationEventRepositoryPort.class.getDeclaredMethod("findById", String.class);
+
+        assertThat(method.getReturnType()).isEqualTo(Optional.class);
+    }
+
+    @Test
+    void noMethodOnNotificationEventRepositoryPortHasClientIdParameter() {
+        for (Method m : NotificationEventRepositoryPort.class.getDeclaredMethods()) {
+            boolean hasClientId = Arrays.stream(m.getParameters())
+                    .anyMatch(p -> p.getType().equals(String.class)
+                            && (p.getName().equals("clientId") || p.getName().contains("client")));
+            assertThat(hasClientId)
+                    .as("NotificationEventRepositoryPort.%s must not have a clientId parameter", m.getName())
+                    .isFalse();
+        }
+    }
+
+    @Test
+    void notificationEventRepositoryPortImportsNoFrameworkType() {
+        for (Method m : NotificationEventRepositoryPort.class.getDeclaredMethods()) {
             assertNoSpringType(m);
         }
     }

@@ -34,6 +34,29 @@ public interface DeliveryPipelineRepositoryPort {
     Delivery insert(Delivery delivery);
 
     /**
+     * Inserts a new delivery row unless a live row already exists for {@code (event_id,
+     * subscription_id)}, in which case the conflict is reported as {@code Optional.empty()}
+     * rather than thrown.
+     *
+     * <p>{@code Optional.empty()} means a live row already exists for
+     * {@code (event_id, subscription_id)} — the idempotent-replay outcome, not a failure.
+     * "Live" is exactly {@code idx_deliveries_live_pair}'s predicate:
+     * {@code status NOT IN ('DELIVERED', 'DEAD', 'FAILED')}. This method and
+     * {@link #findLiveByEventAndSubscription(String, UUID)} must agree on that definition, or
+     * a conflict here could return no row on the follow-up read.
+     *
+     * <p>{@link #insert(Delivery)} is kept, unchanged, and is not deprecated: {@code POST
+     * /replay} and internal recovery (ADR-005 §1) must fail loudly when the pair is still
+     * live, so they keep calling {@code insert}. Ingest is the only caller that wants the
+     * conflict swallowed, which is why it gets its own method instead of a flag on
+     * {@code insert} (ADR-003 §2, Amendment A5).
+     *
+     * @return the inserted {@link Delivery} as persisted, or {@code Optional.empty()} on a
+     *     live-pair conflict
+     */
+    Optional<Delivery> insertIfAbsent(Delivery delivery);
+
+    /**
      * Loads the row the worker just claimed, without a tenant filter.
      *
      * <p>The worker must read {@code event_id}, {@code subscription_id}, the authoritative
@@ -44,6 +67,19 @@ public interface DeliveryPipelineRepositoryPort {
      * port; it does not apply here. See ADR-007 Amendment E1.
      */
     Optional<Delivery> findById(UUID deliveryId);
+
+    /**
+     * Loads the live row, if any, for {@code (event_id, subscription_id)}.
+     *
+     * <p>"Live" is exactly {@code idx_deliveries_live_pair}'s predicate:
+     * {@code status NOT IN ('DELIVERED', 'DEAD', 'FAILED')}. This must agree with
+     * {@link #insertIfAbsent(Delivery)}'s definition of live, or a conflict there could
+     * return no row here. The unique partial index guarantees at most one live row per pair,
+     * which is why the return is {@link Optional} and not {@link List}.
+     *
+     * <p>Cross-tenant like every other method on this port: no {@code clientId} parameter.
+     */
+    Optional<Delivery> findLiveByEventAndSubscription(String eventId, UUID subscriptionId);
 
     /**
      * Claims the delivery for processing: {@code status = 'QUEUED' -> 'PROCESSING'}.
