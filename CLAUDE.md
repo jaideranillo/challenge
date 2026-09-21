@@ -28,6 +28,18 @@ Spring Boot 4.1.1 skeleton (`com.cobre:challenge`), Java 21, Gradle. No business
 - **Blocking Spring MVC on virtual threads** (`spring.threads.virtual.enabled=true`) — no WebFlux, no reactive types anywhere.
 - **Spring Data JDBC**, not JPA/Hibernate. No lazy loading, explicit SQL per repository call.
 
+## Design authority
+
+The ADRs in `docs/architecture/adr/` contain settled decisions. Implement against them.
+Do not reopen the design, propose alternatives, or generate open questions.
+If you believe a decision is wrong, add it to `docs/concerns.md` and keep
+implementing as specified.
+
+## Testing
+
+Domain logic: plain JUnit, no Spring context.
+Adapters: Testcontainers against real Postgres and LocalStack. No H2, no mocked SQS.
+
 ## Subagents (`.claude/agents/`)
 
 - `software-architect` (Atlas) — feature design, port contracts, ADRs, hexagonal governance.
