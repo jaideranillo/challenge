@@ -28,6 +28,8 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-validation'
 	implementation 'org.springframework.boot:spring-boot-starter-webmvc'
 	implementation 'software.amazon.awssdk:sqs:2.27.8'
+	implementation 'io.github.resilience4j:resilience4j-bulkhead:2.3.0'
+	implementation 'io.github.resilience4j:resilience4j-circuitbreaker:2.3.0'
 	developmentOnly 'org.springframework.boot:spring-boot-devtools'
 	developmentOnly 'org.springframework.boot:spring-boot-docker-compose'
 	runtimeOnly 'org.postgresql:postgresql'

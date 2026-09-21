@@ -14,6 +14,7 @@ DLQ_NAME="deliveries-dlq"
 dlq_url=$(awslocal sqs create-queue \
   --queue-name "$DLQ_NAME" \
   --region "$REGION" \
+  --attributes '{"ReceiveMessageWaitTimeSeconds":"20"}' \
   --query 'QueueUrl' --output text)
 
 dlq_arn=$(awslocal sqs get-queue-attributes \

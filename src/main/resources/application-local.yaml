@@ -1,11 +1,21 @@
 # local profile - local development and live demo use only.
-# Timings below (challenge.retry.backoff, challenge.relay.poll-interval)
+# Timings below (challenge.retry.backoff, challenge.relay.poll-interval,
+# challenge.worker.circuit-breaker.*, challenge.worker.retry-after-max)
 # deliberately diverge from the production schedules in ADR-004 SS1
-# (retry backoff) and ADR-002 (relay poll interval) so a full
-# retry cycle fits inside a live demo. The production numbers in those
-# ADRs remain authoritative; do not read these compressed values as real.
+# (retry backoff), ADR-002 (relay poll interval) and ADR-006 SS1.2
+# (circuit-breaker escalation) so a full retry cycle and a full breaker
+# escalation both fit inside a live demo. The production numbers in
+# those ADRs remain authoritative; do not read these compressed values
+# as real.
+# challenge.egress.allowed-hosts is a demo-only egress exception for the
+# local stub receiver; it must never be set in any other profile. This
+# profile permits plaintext (HTTP) egress to allowlisted hosts only.
 
 challenge:
+  egress:
+    # Local demo only. Waives BOTH the HTTPS requirement and the private-range
+    # check for these hosts; applies only while the `local` profile is active.
+    allowed-hosts: [localhost]
   sqs:
     endpoint: http://localhost:4566
     region: us-east-1
@@ -19,3 +29,9 @@ challenge:
     backoff: 2s, 5s, 10s
   relay:
     poll-interval: 2s
+  worker:
+    circuit-breaker:
+      failure-threshold: 3 # demo-compressed, see FEAT-007 ambiguity 3; production value is 10
+      base-cooldown: 10s # demo-compressed, see FEAT-007 ambiguity 3; production value is 30s
+      max-cooldown: 60s # demo-compressed, see FEAT-007 ambiguity 3; production value is 1h
+    retry-after-max: 60s # kept equal to circuit-breaker.max-cooldown, per FEAT-007 ambiguity 4
