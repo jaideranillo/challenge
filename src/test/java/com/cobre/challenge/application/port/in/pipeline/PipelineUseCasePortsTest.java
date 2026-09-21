@@ -59,8 +59,8 @@ class PipelineUseCasePortsTest {
 
     @Test
     void attemptDeliveryResultCarriesStatusAndOutcome() {
-        AttemptDeliveryResult result = new AttemptDeliveryResult(DeliveryStatus.DELIVERED, AttemptOutcome.SUCCESS);
+        AttemptDeliveryResult result = AttemptDeliveryResult.of(DeliveryStatus.DELIVERED, AttemptOutcome.SUCCESS);
         assertThat(result.status()).isEqualTo(DeliveryStatus.DELIVERED);
-        assertThat(result.outcome()).isEqualTo(AttemptOutcome.SUCCESS);
+        assertThat(result.outcome()).contains(AttemptOutcome.SUCCESS);
     }
 }

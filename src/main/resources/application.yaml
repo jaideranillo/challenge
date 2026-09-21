@@ -10,7 +10,25 @@ spring:
     baseline-on-migrate: false
 
 challenge:
+  retry:
+    backoff: 5s, 30s, 2m, 10m, 1h, 6h # ADR-004 SS1 production schedule
   relay:
     enabled: true # ADR-002 §2.1: on by default; off only for the acceptance tests (TASK-006-10/11)
     poll-interval: 5s # ADR-002 §2.1: "a scheduled job, fixedDelay, 5s"
     batch-limit: 500 # ADR-002 §2.1: due-query "LIMIT 500"
+  worker:
+    enabled: true # on by default; false lets a test or demo run without a consumer
+    wait-time: 20s # ADR-002 §2.2, ADR-006 §1.1: long poll
+    batch-size: 10 # ADR-002 §2.2, ADR-006 §1.1: receive batch
+    connect-timeout: 2s # ADR-004 §1 budget table
+    read-timeout: 5s # ADR-004 §1 budget table
+    bulkhead:
+      acquire-timeout: 2s # ADR-006 §1.3
+      defer-min: 10s # ADR-006 §1.3: "10-20s jittered"
+      defer-max: 20s # ADR-006 §1.3
+    circuit-breaker:
+      failure-threshold: 10 # ADR-006 §1.2 / Q7, a labelled proposal
+      base-cooldown: 30s # inferred, FEAT-007 ambiguity 3, a labelled proposal
+      max-cooldown: 1h # inferred, FEAT-007 ambiguity 3, the "capped" of ADR-006 §1.2
+    retry-after-max: 1h # inferred, FEAT-007 ambiguity 4: the clamp ceiling for Retry-After
+    response-excerpt-limit: 1024 # ADR-003 §3: truncation bound for delivery_attempts.response_excerpt

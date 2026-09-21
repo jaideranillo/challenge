@@ -6,6 +6,7 @@ import com.cobre.challenge.application.port.out.queue.NotificationQueuePort;
 import com.cobre.challenge.application.port.out.queue.dto.DeliveryPointer;
 import com.cobre.challenge.application.port.out.queue.dto.PublishBatchResult;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -39,6 +40,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 @Component
 public class SqsNotificationQueueAdapter implements NotificationQueuePort {
 
+	private static final String DELIVERY_ID_ATTRIBUTE = "delivery_id";
 	private static final String TRACEPARENT_ATTRIBUTE = "traceparent";
 	private static final int BATCH_CHUNK_SIZE = 10;
 
@@ -61,7 +63,7 @@ public class SqsNotificationQueueAdapter implements NotificationQueuePort {
 		sqsClient.sendMessage(SendMessageRequest.builder()
 				.queueUrl(queueUrl)
 				.messageBody(toJson(pointer))
-				.messageAttributes(traceparentAttribute(pointer))
+				.messageAttributes(messageAttributes(pointer))
 				.build());
 	}
 
@@ -89,21 +91,28 @@ public class SqsNotificationQueueAdapter implements NotificationQueuePort {
 			entries.add(SendMessageBatchRequestEntry.builder()
 					.id(Integer.toString(i))
 					.messageBody(toJson(pointer))
-					.messageAttributes(traceparentAttribute(pointer))
+					.messageAttributes(messageAttributes(pointer))
 					.build());
 		}
 		return entries;
 	}
 
-	private Map<String, MessageAttributeValue> traceparentAttribute(DeliveryPointer pointer) {
-		return pointer.traceparent()
-				.map(traceparent -> Map.of(
+	private Map<String, MessageAttributeValue> messageAttributes(DeliveryPointer pointer) {
+		Map<String, MessageAttributeValue> attributes = new HashMap<>();
+		attributes.put(
+				DELIVERY_ID_ATTRIBUTE,
+				MessageAttributeValue.builder()
+						.dataType("String")
+						.stringValue(pointer.deliveryId().toString())
+						.build());
+		pointer.traceparent()
+				.ifPresent(traceparent -> attributes.put(
 						TRACEPARENT_ATTRIBUTE,
 						MessageAttributeValue.builder()
 								.dataType("String")
 								.stringValue(traceparent)
-								.build()))
-				.orElseGet(Map::of);
+								.build()));
+		return attributes;
 	}
 
 	private String toJson(DeliveryPointer pointer) {

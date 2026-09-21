@@ -301,6 +301,168 @@ amendment was made, because a sequencing decision is not a reversal.
 
 Two follow-ups this leaves owner-less, both needing a `security-engineer` task
 in a later feature: the authentication itself, before any deployment reachable
-by untrusted traffic and before the worker; and a review of the
-`software.amazon.awssdk:sqs` promotion to a runtime dependency (A03), which now
-lands with only TASK-005-01's own acceptance criteria behind it.
+by untrusted traffic; and a review of the `software.amazon.awssdk:sqs` promotion
+to a runtime dependency (A03), which now lands with only TASK-005-01's own
+acceptance criteria behind it.
+
+**Update 2026-09-21 (Tech Lead call): not blocking FEAT-007.** The events
+currently reaching this endpoint are mock-generated, so the practical exposure
+is low for now and no FEAT-007 task waits on it. The entry stays open and
+unresolved; the deprioritization is a sequencing decision, not a closure.
+
+**Update 2026-09-21 (scope correction): this is not an SSRF problem.** An
+earlier draft of the FEAT-007 entry below combined the two. They are distinct
+and are tracked separately from here on. The webhook destination comes from the
+`subscriptions` row, never from the inbound event, so an unauthenticated caller
+cannot choose where the platform connects. What it *can* do is cause deliveries
+to fire at **existing, legitimate subscription targets**, with content it chose,
+signed by the platform. That is amplification and abuse of the delivery pipeline
+against the platform's own clients — a real problem with a different shape, a
+different fix (authenticate the producer) and a different blast radius from
+SSRF, whose fix is outbound URL validation. Merging them would have hidden the
+fact that closing one closes nothing of the other.
+
+## FEAT-007 fixes four values the ADRs leave explicitly open
+
+Recorded during the FEAT-007 (delivery worker) breakdown, 2026-09-21. None of
+these is a contradiction in an ADR; each is a place an `Accepted` ADR says the
+value or the mechanism is a follow-up, and the worker cannot ship without one.
+Each is fixed to the smallest concrete choice, bound to a configuration key, and
+is listed in `docs/features/FEAT-007-delivery-worker/feature.md`'s "Ambiguities
+resolved by inference" table. **No ADR was amended.**
+
+1. **Signing scheme (ADR-004 §2: "digest algorithm, canonicalization, header
+   encoding ... remains a follow-up").** FEAT-007 uses HMAC-SHA256 over
+   `<X-Cobre-Timestamp value> + "." + <body UTF-8>`, lowercase hex, in
+   `X-Cobre-Signature`, with `X-Cobre-Signature-Previous` during a rotation
+   window. The two-header shape is ADR-004 §2's own stated preference; the
+   algorithm, separator and encoding are this feature's choice and are the part
+   a later signing-scheme decision may overrule. Changing them is a client-facing
+   breaking change once anyone integrates, which is the reason for recording it
+   here rather than leaving it in code.
+2. **Secret resolution (ADR-004 §3: `secret_ref` is "a secrets-manager key").**
+   No secrets manager exists in this project and no ADR designs one. FEAT-007
+   adds `WebhookSecretPort` with a configuration-backed resolver
+   (`challenge.webhook.secrets.<ref>`). The ADR's invariant is preserved — the
+   database still holds a reference, never plaintext — but the reference now
+   resolves against configuration, which is weaker than a managed secret store
+   in rotation, audit and blast radius. The port is the seam: replacing it is a
+   one-adapter change.
+3. **Circuit-breaker numbers (ADR-006 Q7: "proposals, not derived numbers").**
+   **Profile-specific**, per Tech Lead direction of 2026-09-21. Default profile
+   (production): threshold 10, base cooldown 30s, cap 1h, giving 30s -> 1m ->
+   2m -> ... -> 1h. `local` profile (demo): threshold 3, base 10s, cap 60s,
+   giving 10s -> 20s -> 40s -> 60s. The escalation is not a separate setting; it
+   is ADR-006 §1.2's `base * 2^consecutive_opens` capped at the max, with
+   different inputs. The threshold's production value is ADR-006 §1.2's own
+   proposal; every other number here is FEAT-007's, and all of them are
+   configuration keys. The local values sit with the compressed retry backoff
+   and relay poll interval already in `application-local.yaml`, under that
+   file's existing warning that local timings are not the real ones.
+4. **What makes a `Retry-After` usable (ADR-004 §1's "when present and sane").**
+   A parseable positive value above the profile's ceiling is **clamped to the
+   ceiling, not rejected** — 1h in production, 60s locally, deliberately equal
+   to the breaker's `max-cooldown` so a client cannot park a subscription for
+   longer than the breaker's own worst case. Zero, negative, a past date and
+   unparseable text all fall back to the normal backoff schedule, which is a
+   normal outcome and never an error. **Both RFC 7231 forms are accepted**,
+   delta-seconds and HTTP-date: a date-form value is not illegible merely for
+   being non-numeric, and treating it as garbage would silently downgrade every
+   client that uses it.
+
+## FEAT-007 closes SSRF at the application level; only the network-level half defers
+
+ADR-002's A01 row names the exposure ("the webhook URL is client-supplied and
+the service calls it from inside the platform network") and defers the design;
+ADR-007 §Downstream calls it "its own follow-up". **Tech Lead direction of
+2026-09-21 splits that row in two, and only one half defers:**
+
+**(a) Network-level egress controls — still deferred.** Security groups, egress
+restriction, a controlled NAT or proxy path. Infrastructure, not code, and not
+applicable to a local run. Unchanged, unowned, and still needing its own ADR or
+infrastructure work.
+
+**(b) Application-level SSRF validation — implemented in FEAT-007, not
+deferred.** `OutboundUrlValidator` (TASK-007-19), wired into the outbound
+adapter before any socket opens (TASK-007-20): HTTPS only; DNS resolved and
+every resulting address checked; loopback, any-local, private, link-local
+(including `169.254.169.254`), multicast and IPv4-mapped forms rejected; DNS
+failure fails closed; redirects never followed. Validation runs **on every
+attempt**, never once at subscription creation, which is the DNS-rebinding
+defense.
+
+Two things are recorded here rather than left in code:
+
+1. **The local-profile allowlist is a deliberate, narrow exception, and as of
+   2026-09-21 it waives the HTTPS rule as well.** The demo's stub receiver runs
+   on `localhost` over plain HTTP, and nothing in this project configures
+   `server.ssl`. The allowlist (`challenge.egress.allowed-hosts`) alone waived
+   only the private-range check, so a local attempt still died on the scheme:
+   the exception existed and did nothing. Rather than terminate TLS in front of
+   the stub — which needs either a committed private key or a profile-specific
+   `SSLContext` on the webhook client, i.e. relaxing the very TLS path ADR-004
+   §2 protects, plus certificate expiry as a recurring way for the demo to
+   break — the scheme rule itself is made waivable, in the one class whose job
+   is to make that decision.
+
+   The waiver requires **two conditions**: the host must be in
+   `challenge.egress.allowed-hosts`, **and** the active Spring profile must be
+   `local`. Every other profile keeps HTTPS mandatory with no exceptions. It
+   never applies to a host that is not on the list, so it cannot become a
+   blanket "plaintext is fine", and an allowlist entry that somehow appeared in
+   a production configuration would waive nothing on its own.
+
+   An earlier draft of this decision used a second boolean property plus a
+   fail-fast startup guard instead of the profile check. The Tech Lead chose the
+   profile, and it is the better condition: a profile is a first-class
+   deployment concept rather than one more YAML line, it cannot be set by
+   editing `application.yaml`, and it needs no guard bean to police a flag that
+   no longer exists. Neither that property nor that guard should be
+   reintroduced.
+
+   The unit test that rejects `localhost`, the private ranges and
+   `169.254.169.254` under the default profile is the guard that this waiver
+   never reaches production. If it is ever deleted or weakened, this entry is
+   the record of why it existed.
+2. **RESOLVED (2026-09-21): the ADR-004 §1 classification divergence is closed,
+   with no contract change.** *History, kept deliberately:* an earlier draft of
+   this feature routed a validator rejection through the adapter as a transport
+   failure, which `ResponseClassifier` maps to `RETRYABLE`, so a blocked URL
+   would have retried instead of dying immediately as ADR-004 §1 requires. That
+   draft concluded no `AttemptOutcome` value could express it and logged a
+   standing deviation. **That conclusion was wrong.** `NON_RETRYABLE` already
+   exists, already terminates in `DEAD`, and already returns `false` from
+   `countsTowardCircuitBreaker()` — which is exactly the required semantics.
+
+   The resolution, per Tech Lead direction:
+   - The validator returns a three-state verdict, and the **use case** — not the
+     adapter — classifies it, because the use case is where classification
+     already lives and `WebhookResponse` cannot express a permanent failure.
+   - `POLICY_REJECTED` (resolved cleanly to a private/reserved range, the
+     metadata IP, or a non-HTTPS scheme) -> `NON_RETRYABLE` -> `DEAD`. Retrying
+     changes nothing, and it indicates invalid configuration rather than an
+     unhealthy client endpoint.
+   - `DNS_FAILURE` (timeout, NXDOMAIN, resolver error) -> `RETRYABLE`, and it
+     **does** count toward the breaker, exactly as ADR-004 §1 already classifies
+     a DNS failure. The two are deliberately not collapsed.
+   - A policy rejection does **not** count toward the breaker. The breaker
+     measures the health of a resolved endpoint; a rejected target was never
+     contacted.
+   - The attempt is recorded the way ADR-003 §3 already models a pre-HTTP
+     failure: `error` set, `http_status` absent. No new column.
+   - A policy rejection emits a security signal — the untagged counter
+     `notification.webhook.egress.rejected` and a warn log with `delivery_id`,
+     `subscription_id`, host and resolved address — because a target resolving
+     into a private or metadata range is possible SSRF or DNS rebinding, not a
+     routine dead delivery.
+
+   **No `AttemptOutcome` value, no `TransportFailure` value, no enum, no column
+   and no port signature changed.** Delivered by TASK-007-19 and TASK-007-20,
+   verified in TASK-007-21. Nothing in ADR-004 §1 is now diverged from.
+
+Note what this entry does **not** claim. It is a separate problem from the
+unauthenticated ingest endpoint recorded above, and the two must not be merged:
+the destination URL always comes from the `subscriptions` row, so an
+unauthenticated caller cannot steer the outbound connection. That caller's
+leverage is amplification against existing subscription targets, which is
+tracked in its own entry with its own fix.
