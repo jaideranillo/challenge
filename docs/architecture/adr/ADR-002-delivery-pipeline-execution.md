@@ -189,6 +189,26 @@ Between steps 1 and 5 the worker also loads the claimed row through the pipeline
 
 The due-query itself is unchanged, and the promotion remains a separate write the relay use case issues for subscriptions the query admitted as cooled-down. No reaper job, no timer, exactly as §2.1 already says.
 
+### C3. §1.1's ingest steps now name their operations, and §3.1's traceparent gets an injection point
+
+Made on **Tech Lead directive of 2026-09-20** while planning FEAT-005. §1.1's five steps are unchanged in substance; this names the port operation each one invokes, in the same way C1 did for §2.2, and closes the one place where §1.1 and §3.1 together required something no port expressed.
+
+| §1.1 step | Operation |
+| --- | --- |
+| 2, resolve matching subscriptions | `SubscriptionRepositoryPort.findActiveForEvent(clientId, eventType)` — `client_id` is a query predicate, never a post-hoc filter (§1.1, ADR-003 §2) |
+| 3, event row | `NotificationEventRepositoryPort.insertIfAbsent(event)` (ADR-003 Amendment A5) |
+| 3, one `deliveries` row per match | `DeliveryPipelineRepositoryPort.insertIfAbsent(delivery)`, falling back to `findLiveByEventAndSubscription` on `Optional.empty()` (ADR-003 Amendment A5) |
+| 4, commit and respond `202` | the use case's `@Transactional` boundary, which ends before step 5 begins |
+| 5, best-effort publish | `NotificationQueuePort.publish(pointer)` (ADR-004 SS1), invoked **outside** that boundary |
+
+**Step 5's mechanism is named, because "after the response" is a correctness property here, not prose.** The transaction and the publish never share a unit of work (§1.1's closing paragraph), and the publish must not be able to fail the request. Concretely: the ingest use case registers an after-commit callback which **submits** the publish to a virtual-thread executor and returns. The request thread is not the publishing thread, so the `202` is already on its way out when the `SendMessage` starts, and a publish that throws, times out or never runs cannot reach the producer. Every failure is caught at the submission boundary and logged by `delivery_id` (never with `content`, §3.1's PII rule).
+
+A publish failure is therefore invisible to the caller by design, which would also make it invisible to operations. It is counted: **`notification.ingest.publish.failed`**, a plain counter, no `client_id` or `subscription_id` tag (Q8). This is the only signal that the latency optimization is degraded; the relay still delivers (ADR-001 §1, §2), so the alert is a warning, not a page.
+
+**`TraceContextPort`.** ADR-003 Amendment A3 makes `trace_context` a value the ingest use case **writes**, and §3.1 defines it as the current W3C `traceparent`. Reading it means touching Micrometer/OpenTelemetry, and a use case in this codebase carries no framework type but `@Transactional`. A single-method outbound port `Optional<String> currentTraceparent()` (`application/port/out/tracing`) is added, implemented by a Micrometer-backed adapter. `Optional.empty()` when no span is active is a normal outcome: the column is nullable (`V2`), and §3.1's consumer-side fallback already handles an absent value.
+
+No new ADR, because nothing above reverses a decision: §1.1 already specified every step, §3.1 already specified the traceparent, and ADR-004 SS1 already specified the publisher port.
+
 ## Downstream
 
-All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments C1-C2 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`.
+All seven ADRs (ADR-001 through ADR-007) are now `Accepted`. Part of the `docs/features/FEAT-002-webhook-notification-delivery/` breakdown, ready for task generation. Amendments C1-C2 above are delivered by `docs/features/FEAT-004-outbound-persistence-adapters/`; Amendment C3 by `docs/features/FEAT-005-event-ingest-use-case/`.

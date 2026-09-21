@@ -269,3 +269,38 @@ implementations were kept as their own top-level files directly in
 `application.port.in.selfservice` rather than under `dto`, since they are a
 behavioral result hierarchy, not plain data-transfer records. TASK-003-10/11/12/13
 updated to reflect the current file layout (2026-09-20).
+
+## The ingest endpoint ships unauthenticated (FEAT-005, open)
+
+At the Tech Lead's explicit direction of 2026-09-20, producer-to-gateway
+authentication was cut from FEAT-005 after the breakdown was written. The
+`security-engineer` task that carried it was removed rather than deferred within
+the feature, and no task in FEAT-005 is assigned to that role. Implementing as
+specified, per the "Design authority" rule in CLAUDE.md; logging it here because
+it is an open exposure rather than a design disagreement.
+
+What ships: `POST /internal/events` is reachable without a credential. An
+unauthenticated caller can write arbitrary `notification_events` and
+`deliveries` rows for any `client_id`. The tenant model of that endpoint —
+the caller chooses `client_id` in the request body — is correct only on the
+premise that the caller is an authenticated internal producer (ADR-002 §1.1:
+"the caller is a platform-internal service, not a client"). Without
+authentication that premise does not hold, so A01 and A07 are one open
+exposure, not two independent ones.
+
+Why it matters more later than it does today: FEAT-005 makes no outbound call.
+Once the worker lands, a row written through this endpoint becomes an HTTPS POST
+of attacker-chosen content to a client's registered webhook URL, signed by the
+platform. The exposure grows from "junk rows in two tables" to "the platform
+delivers attacker payloads to clients under its own signature."
+
+Not changed by the cut: ADR-002 §1.1 step 1 and Q10 remain `Accepted` — IAM /
+SigV4 is still the decision, and Q10's "edge vs. application" question stays
+open rather than being resolved by TASK-005-16 as originally planned. No ADR
+amendment was made, because a sequencing decision is not a reversal.
+
+Two follow-ups this leaves owner-less, both needing a `security-engineer` task
+in a later feature: the authentication itself, before any deployment reachable
+by untrusted traffic and before the worker; and a review of the
+`software.amazon.awssdk:sqs` promotion to a runtime dependency (A03), which now
+lands with only TASK-005-01's own acceptance criteria behind it.

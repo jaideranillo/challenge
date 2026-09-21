@@ -42,6 +42,28 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
     // (logged in docs/concerns.md).
     private static final String CLAIM_DUE_PUSH_INTERVAL = "5 minutes";
 
+    // Shared by insert, insertIfAbsent and their RETURNING clauses, and by
+    // findLiveByEventAndSubscription's SELECT list, so the three statements cannot drift
+    // apart on which columns a delivery carries.
+    private static final String INSERT_COLUMNS =
+            "delivery_id, event_id, subscription_id, client_id, status, origin,"
+                    + " replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
+                    + " event_created_at, trace_context";
+
+    private static final String INSERT_VALUES =
+            ":delivery_id, :event_id, :subscription_id, :client_id,"
+                    + " :status::delivery_status, :origin::delivery_origin,"
+                    + " :replayed_from, :attempt_count, :next_attempt_at, :last_error, :delivered_at,"
+                    + " :event_created_at, :trace_context";
+
+    // idx_deliveries_live_pair (V2): status NOT IN ('DELIVERED', 'DEAD', 'FAILED'). Repeated
+    // verbatim here (as the ON CONFLICT inference predicate) and in
+    // findLiveByEventAndSubscription's WHERE clause. If that index's predicate ever changes,
+    // both must change with it, or a conflict could report a live pair that the read below
+    // would fail to find, or vice versa.
+    private static final String LIVE_STATUS_PREDICATE =
+            "status NOT IN ('DELIVERED'::delivery_status, 'DEAD'::delivery_status, 'FAILED'::delivery_status)";
+
     private final NamedParameterJdbcTemplate jdbcTemplate;
     private final DeliveryRowMapper deliveryRowMapper;
 
@@ -69,21 +91,39 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
      */
     @Override
     public Delivery insert(Delivery delivery) {
-        String sql =
-                "INSERT INTO deliveries ("
-                        + "  delivery_id, event_id, subscription_id, client_id, status, origin,"
-                        + "  replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
-                        + "  event_created_at, trace_context"
-                        + ") VALUES ("
-                        + "  :delivery_id, :event_id, :subscription_id, :client_id,"
-                        + "  :status::delivery_status, :origin::delivery_origin,"
-                        + "  :replayed_from, :attempt_count, :next_attempt_at, :last_error, :delivered_at,"
-                        + "  :event_created_at, :trace_context"
-                        + ") RETURNING "
-                        + "  delivery_id, event_id, subscription_id, client_id, status, origin,"
-                        + "  replayed_from, attempt_count, next_attempt_at, last_error, delivered_at,"
-                        + "  event_created_at, trace_context";
+        String sql = "INSERT INTO deliveries (" + INSERT_COLUMNS + ") VALUES (" + INSERT_VALUES + ")"
+                + " RETURNING " + INSERT_COLUMNS;
 
+        return jdbcTemplate.queryForObject(sql, insertParams(delivery), insertRowMapper());
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>ON CONFLICT inference clause coupling.</strong> The {@code WHERE} predicate
+     * below repeats {@code idx_deliveries_live_pair} (V2) verbatim, in the same order and with
+     * the same literals as the index. Postgres cannot infer a partial unique index for
+     * {@code ON CONFLICT} without an identical predicate here; a mismatch fails at runtime
+     * with "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+     * not at compile time. If the index's predicate ever changes, this statement changes with
+     * it — see {@link #LIVE_STATUS_PREDICATE}.
+     *
+     * <p>Shares its column list, bindings and {@code RETURNING} mapping with {@link #insert}
+     * through {@link #insertParams(Delivery)} and {@link #INSERT_COLUMNS}, so ingest and replay
+     * rows can never carry different columns.
+     */
+    @Override
+    public Optional<Delivery> insertIfAbsent(Delivery delivery) {
+        String sql = "INSERT INTO deliveries (" + INSERT_COLUMNS + ") VALUES (" + INSERT_VALUES + ")"
+                + " ON CONFLICT (event_id, subscription_id) WHERE " + LIVE_STATUS_PREDICATE
+                + " DO NOTHING"
+                + " RETURNING " + INSERT_COLUMNS;
+
+        List<Delivery> result = jdbcTemplate.query(sql, insertParams(delivery), insertRowMapper());
+        return result.isEmpty() ? Optional.empty() : Optional.of(result.get(0));
+    }
+
+    private MapSqlParameterSource insertParams(Delivery delivery) {
         Map<String, Object> params = new HashMap<>();
         params.put("delivery_id", delivery.deliveryId());
         params.put("event_id", delivery.eventId());
@@ -101,8 +141,7 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
         // event_created_at: bound from the aggregate, never from now() (ADR-003 Amendment A4)
         params.put("event_created_at", OffsetDateTime.ofInstant(delivery.eventCreatedAt(), ZoneOffset.UTC));
         params.put("trace_context", delivery.traceContext().orElse(null));
-
-        return jdbcTemplate.queryForObject(sql, params, insertRowMapper());
+        return new MapSqlParameterSource(params);
     }
 
     /**
@@ -125,6 +164,32 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
 
         List<Delivery> results = jdbcTemplate.query(
                 sql, new MapSqlParameterSource("id", deliveryId), insertRowMapper());
+        return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Uses the identical {@link #LIVE_STATUS_PREDICATE} that {@link #insertIfAbsent} uses
+     * for its {@code ON CONFLICT} inference clause, so a conflict there can never fail to find
+     * a row here. The unique partial index guarantees at most one match; more than one row is
+     * a broken invariant and fails loudly rather than picking one silently.
+     */
+    @Override
+    public Optional<Delivery> findLiveByEventAndSubscription(String eventId, UUID subscriptionId) {
+        String sql = "SELECT " + INSERT_COLUMNS + " FROM deliveries"
+                + " WHERE event_id = :event_id AND subscription_id = :subscription_id"
+                + "   AND " + LIVE_STATUS_PREDICATE;
+
+        List<Delivery> results = jdbcTemplate.query(sql, new MapSqlParameterSource()
+                .addValue("event_id", eventId)
+                .addValue("subscription_id", subscriptionId), insertRowMapper());
+
+        if (results.size() > 1) {
+            throw new IllegalStateException(
+                    "idx_deliveries_live_pair invariant broken: more than one live delivery for"
+                            + " event_id/subscription_id pair");
+        }
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
     }
 
