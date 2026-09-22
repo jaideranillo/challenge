@@ -7,12 +7,14 @@ import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPage;
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPageQuery;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -26,6 +28,11 @@ import org.springframework.stereotype.Repository;
  * (ADR-007 Amendment E1). Tenant isolation on this class is structural: the predicate is part
  * of the SQL, never a post-hoc Java filter.
  *
+ * <p>Runs on the API pool ({@code apiJdbcTemplate}, ADR-007 §5.4) so row level security applies;
+ * {@link TenantSessionBinder#bind(TenantId)} is called before every query to set the session
+ * variable the RLS policies read. The bound SQL predicate below is layer 2 (ADR-007 §I-B); the
+ * session binding is layer 3 (§I-D) — neither replaces the other.
+ *
  * <p>No {@code @Transactional}. No mutable state. Safe to share across virtual threads.
  */
 @Repository
@@ -37,11 +44,15 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
                     + " delivered_at, event_created_at, trace_context";
 
     private final NamedParameterJdbcTemplate jdbcTemplate;
+    private final TenantSessionBinder tenantSessionBinder;
     private final DeliveryRowMapper deliveryRowMapper;
 
     public DeliveryQueryJdbcRepository(
-            NamedParameterJdbcTemplate jdbcTemplate, DeliveryRowMapper deliveryRowMapper) {
+            @Qualifier("apiJdbcTemplate") NamedParameterJdbcTemplate jdbcTemplate,
+            TenantSessionBinder tenantSessionBinder,
+            DeliveryRowMapper deliveryRowMapper) {
         this.jdbcTemplate = jdbcTemplate;
+        this.tenantSessionBinder = tenantSessionBinder;
         this.deliveryRowMapper = deliveryRowMapper;
     }
 
@@ -62,7 +73,8 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
      * distinguishable "wrong tenant" exception would hand the web layer the means to leak it.
      */
     @Override
-    public Optional<Delivery> findById(UUID deliveryId, String clientId) {
+    public Optional<Delivery> findById(UUID deliveryId, TenantId tenant) {
+        tenantSessionBinder.bind(tenant);
         String sql = "SELECT " + SELECT_COLUMNS
                 + " FROM deliveries"
                 + " WHERE delivery_id = :delivery_id AND client_id = :client_id";
@@ -70,7 +82,7 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
         List<Delivery> results = jdbcTemplate.query(sql,
                 new MapSqlParameterSource()
                         .addValue("delivery_id", deliveryId)
-                        .addValue("client_id", clientId),
+                        .addValue("client_id", tenant.value()),
                 deliveryRowMapper);
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
     }
@@ -112,10 +124,11 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
      * must not silently return page 1 (A10).
      */
     @Override
-    public DeliveryPage findPage(String clientId, DeliveryPageQuery query, int limit) {
+    public DeliveryPage findPage(TenantId tenant, DeliveryPageQuery query, int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive, was " + limit);
         }
+        tenantSessionBinder.bind(tenant);
 
         Optional<Instant> eventCreatedFrom = query.eventCreatedFrom();
         Optional<Instant> eventCreatedTo = query.eventCreatedTo();
@@ -123,7 +136,7 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
         Optional<String> cursor = query.cursor();
 
         MapSqlParameterSource params = new MapSqlParameterSource()
-                .addValue("client_id", clientId)
+                .addValue("client_id", tenant.value())
                 .addValue("limit_plus_one", limit + 1);
 
         StringBuilder sql = new StringBuilder(

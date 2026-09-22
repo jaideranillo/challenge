@@ -9,6 +9,7 @@ import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPage;
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPageQuery;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -70,7 +71,7 @@ class DeliveryFindPageTest {
         UUID id = insertDeliveryWithEca(clientId, subscriptionId, eventTs);
 
         // Query window around event date — should find it
-        DeliveryPage inWindow = repo.findPage(clientId,
+        DeliveryPage inWindow = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(
                         Optional.of(eventTs.minus(1, ChronoUnit.DAYS)),
                         Optional.of(eventTs.plus(1, ChronoUnit.DAYS)),
@@ -80,7 +81,7 @@ class DeliveryFindPageTest {
 
         // Query window around today (created_at) — should NOT find it
         Instant now = Instant.now();
-        DeliveryPage todayWindow = repo.findPage(clientId,
+        DeliveryPage todayWindow = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(
                         Optional.of(now.minus(1, ChronoUnit.HOURS)),
                         Optional.of(now.plus(1, ChronoUnit.HOURS)),
@@ -104,7 +105,7 @@ class DeliveryFindPageTest {
         UUID id2 = insertDeliveryWithEca(clientId, subscriptionId, t2);
         UUID id3 = insertDeliveryWithEca(clientId, subscriptionId, t3);
 
-        DeliveryPage page = repo.findPage(clientId, DeliveryPageQuery.unfiltered(), 10);
+        DeliveryPage page = repo.findPage(new TenantId(clientId), DeliveryPageQuery.unfiltered(), 10);
 
         List<UUID> ids = page.deliveries().stream().map(Delivery::deliveryId).collect(Collectors.toList());
         // Newest first (DESC)
@@ -136,7 +137,7 @@ class DeliveryFindPageTest {
         int pages = 0;
         boolean hasMore = true;
         while (hasMore) {
-            DeliveryPage page = repo.findPage(clientId,
+            DeliveryPage page = repo.findPage(new TenantId(clientId),
                     new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursor),
                     10);
             for (Delivery d : page.deliveries()) {
@@ -170,7 +171,7 @@ class DeliveryFindPageTest {
         int pages = 0;
         boolean hasMore = true;
         while (hasMore) {
-            DeliveryPage page = repo.findPage(clientId,
+            DeliveryPage page = repo.findPage(new TenantId(clientId),
                     new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursor),
                     3);
             for (Delivery d : page.deliveries()) {
@@ -192,7 +193,7 @@ class DeliveryFindPageTest {
             insertDeliveryWithEca(clientId, subscriptionId,
                     Instant.now().minus(i, ChronoUnit.HOURS).truncatedTo(ChronoUnit.SECONDS));
         }
-        DeliveryPage page = repo.findPage(clientId, DeliveryPageQuery.unfiltered(), 5);
+        DeliveryPage page = repo.findPage(new TenantId(clientId), DeliveryPageQuery.unfiltered(), 5);
         assertThat(page.deliveries()).hasSize(5);
         assertThat(page.nextCursor()).isEmpty();
     }
@@ -200,7 +201,7 @@ class DeliveryFindPageTest {
     /** Test 9: empty result returns empty list and no cursor, never null. */
     @Test
     void findPage_emptyResult_emptyListAndNoCursor() {
-        DeliveryPage page = repo.findPage("no-such-client-" + UUID.randomUUID(),
+        DeliveryPage page = repo.findPage(new TenantId("no-such-client-" + UUID.randomUUID()),
                 DeliveryPageQuery.unfiltered(), 10);
         assertThat(page.deliveries()).isNotNull().isEmpty();
         assertThat(page.nextCursor()).isEmpty();
@@ -217,25 +218,25 @@ class DeliveryFindPageTest {
         UUID id = insertDeliveryWithEca(clientId, subscriptionId, ts);
 
         // from only (inclusive): ts itself is included (>= from)
-        DeliveryPage fromOnly = repo.findPage(clientId,
+        DeliveryPage fromOnly = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.of(ts), Optional.empty(), Optional.empty(), Optional.empty()),
                 10);
         assertThat(fromOnly.deliveries().stream().map(Delivery::deliveryId)).contains(id);
 
         // from after ts: excluded
-        DeliveryPage fromAfter = repo.findPage(clientId,
+        DeliveryPage fromAfter = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.of(ts.plus(1, ChronoUnit.SECONDS)), Optional.empty(),
                         Optional.empty(), Optional.empty()),
                 10);
         assertThat(fromAfter.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(id);
 
         // to only (exclusive): ts+1s is included; ts itself excluded when to=ts
-        DeliveryPage toExclusive = repo.findPage(clientId,
+        DeliveryPage toExclusive = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.of(ts), Optional.empty(), Optional.empty()),
                 10);
         assertThat(toExclusive.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(id);
 
-        DeliveryPage toAfter = repo.findPage(clientId,
+        DeliveryPage toAfter = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.of(ts.plus(1, ChronoUnit.SECONDS)),
                         Optional.empty(), Optional.empty()),
                 10);
@@ -250,7 +251,7 @@ class DeliveryFindPageTest {
         UUID delivered = insertDeliveryWithEcaAndStatus(clientId, subscriptionId, ts, "DELIVERED");
 
         // Status=PENDING only
-        DeliveryPage pendingPage = repo.findPage(clientId,
+        DeliveryPage pendingPage = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.empty(),
                         Optional.of(DeliveryStatus.PENDING), Optional.empty()),
                 10);
@@ -258,7 +259,7 @@ class DeliveryFindPageTest {
         assertThat(pendingPage.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(delivered);
 
         // Status=PENDING + date window
-        DeliveryPage combined = repo.findPage(clientId,
+        DeliveryPage combined = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(
                         Optional.of(ts.minus(1, ChronoUnit.MINUTES)),
                         Optional.of(ts.plus(1, ChronoUnit.MINUTES)),
@@ -286,16 +287,16 @@ class DeliveryFindPageTest {
 
         // All filter combinations
         List<DeliveryPage> pages = List.of(
-                repo.findPage(clientId, DeliveryPageQuery.unfiltered(), 50),
-                repo.findPage(clientId,
+                repo.findPage(new TenantId(clientId), DeliveryPageQuery.unfiltered(), 50),
+                repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.of(ts.minus(1, ChronoUnit.HOURS)), Optional.empty(),
                                 Optional.empty(), Optional.empty()),
                         50),
-                repo.findPage(clientId,
+                repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.empty(), Optional.of(ts.plus(1, ChronoUnit.HOURS)),
                                 Optional.empty(), Optional.empty()),
                         50),
-                repo.findPage(clientId,
+                repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.empty(), Optional.empty(),
                                 Optional.of(DeliveryStatus.PENDING), Optional.empty()),
                         50)
@@ -330,12 +331,12 @@ class DeliveryFindPageTest {
         UUID bId = insertDeliveryWithEca(tenantB, subB, ts.plus(1, ChronoUnit.HOURS));
 
         // Get a cursor as tenant A
-        DeliveryPage pageA = repo.findPage(tenantA, DeliveryPageQuery.unfiltered(), 1);
+        DeliveryPage pageA = repo.findPage(new TenantId(tenantA), DeliveryPageQuery.unfiltered(), 1);
         Optional<String> cursorFromA = pageA.nextCursor();
 
         if (cursorFromA.isPresent()) {
             // Tenant B uses that cursor — should only return tenant B rows
-            DeliveryPage pageB = repo.findPage(tenantB,
+            DeliveryPage pageB = repo.findPage(new TenantId(tenantB),
                     new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursorFromA),
                     10);
             assertThat(pageB.deliveries().stream().map(Delivery::deliveryId))
@@ -347,7 +348,7 @@ class DeliveryFindPageTest {
     /** Test 14: malformed cursor propagates MalformedCursorException; does NOT return page 1. */
     @Test
     void findPage_malformedCursor_propagatesException_notPage1() {
-        assertThatThrownBy(() -> repo.findPage(clientId,
+        assertThatThrownBy(() -> repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(),
                         Optional.of("not-a-valid-cursor!!!")),
                 10))

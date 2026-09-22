@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.Profiles;
@@ -44,6 +45,7 @@ public class OutboundUrlValidator {
     private final Set<String> allowedHosts;
     private final boolean localProfileActive;
 
+    @Autowired
     public OutboundUrlValidator(EgressProperties properties, Environment environment) {
         this(properties, environment.acceptsProfiles(Profiles.of("local")), DEFAULT_RESOLVER);
     }

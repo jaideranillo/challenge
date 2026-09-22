@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.cobre.challenge.TestcontainersConfiguration;
 import com.cobre.challenge.domain.model.delivery.Delivery;
+import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.util.Optional;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
@@ -42,7 +43,7 @@ class DeliveryQueryJdbcRepositoryTest {
     @Test
     void findById_ownTenant_returnsDelivery() {
         UUID deliveryId = insertDelivery(clientId, subscriptionId);
-        Optional<Delivery> result = repo.findById(deliveryId, clientId);
+        Optional<Delivery> result = repo.findById(deliveryId, new TenantId(clientId));
         assertThat(result).isPresent();
         assertThat(result.get().deliveryId()).isEqualTo(deliveryId);
         assertThat(result.get().clientId()).isEqualTo(clientId);
@@ -62,14 +63,14 @@ class DeliveryQueryJdbcRepositoryTest {
         UUID deliveryId = insertDelivery(otherClientId, otherSub);
 
         // Query with wrong client_id
-        Optional<Delivery> result = repo.findById(deliveryId, clientId);
+        Optional<Delivery> result = repo.findById(deliveryId, new TenantId(clientId));
         assertThat(result).isEmpty();
     }
 
     /** Test 3: non-existent id returns Optional.empty(). */
     @Test
     void findById_nonExistentId_returnsEmpty() {
-        assertThat(repo.findById(UUID.randomUUID(), clientId)).isEmpty();
+        assertThat(repo.findById(UUID.randomUUID(), new TenantId(clientId))).isEmpty();
     }
 
     /**
@@ -85,8 +86,8 @@ class DeliveryQueryJdbcRepositoryTest {
         UUID foreignId = insertDelivery(otherClientId, otherSub);
         UUID nonExistentId = UUID.randomUUID();
 
-        Optional<Delivery> wrongTenant = repo.findById(foreignId, clientId);
-        Optional<Delivery> nonExistent = repo.findById(nonExistentId, clientId);
+        Optional<Delivery> wrongTenant = repo.findById(foreignId, new TenantId(clientId));
+        Optional<Delivery> nonExistent = repo.findById(nonExistentId, new TenantId(clientId));
 
         assertThat(wrongTenant).isEmpty();
         assertThat(nonExistent).isEmpty();
@@ -98,7 +99,7 @@ class DeliveryQueryJdbcRepositoryTest {
     @Test
     void findById_sqlInjectionAttemptInClientId_returnsEmpty_a05() {
         UUID id = insertDelivery(clientId, subscriptionId);
-        Optional<Delivery> result = repo.findById(id, "' OR 1=1 --");
+        Optional<Delivery> result = repo.findById(id, new TenantId("' OR 1=1 --"));
         assertThat(result).isEmpty();
     }
 

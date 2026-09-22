@@ -123,6 +123,43 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
         return result.isEmpty() ? Optional.empty() : Optional.of(result.get(0));
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Adds a {@code WHERE NOT EXISTS} guard for an already-{@code DELIVERED} row ahead of
+     * the same {@code ON CONFLICT WHERE} {@link #LIVE_STATUS_PREDICATE} clause
+     * {@link #insertIfAbsent} uses, closing ADR-005 §1's second 409 condition inside the
+     * statement PostgreSQL evaluates against committed state at insert time. {@code 'DELIVERED'}
+     * is a SQL literal here, never a bound value.
+     *
+     * <p><strong>Residual (not closed by this statement):</strong> a pair going
+     * {@code DELIVERED} by a concurrent commit between this statement's {@code NOT EXISTS}
+     * check and its own insert is not atomic with it — closing that would need
+     * {@code SERIALIZABLE} or an advisory lock on the pair, which is not worth it here: the
+     * worst case is one extra {@code PENDING} replay row that the relay delivers, i.e. one
+     * duplicate webhook, already covered by ADR-004's at-least-once/subscriber-idempotency
+     * contract.
+     *
+     * <p>Shares {@link #INSERT_COLUMNS}, {@link #INSERT_VALUES}, {@link #LIVE_STATUS_PREDICATE},
+     * {@link #insertParams(Delivery)} and the {@code RETURNING} mapper with {@link #insertIfAbsent}.
+     */
+    @Override
+    public Optional<Delivery> insertReplayIfAbsent(Delivery delivery) {
+        String sql = "INSERT INTO deliveries (" + INSERT_COLUMNS + ")"
+                + " SELECT " + INSERT_VALUES
+                + " WHERE NOT EXISTS ("
+                + "   SELECT 1 FROM deliveries"
+                + "    WHERE event_id = :event_id"
+                + "      AND subscription_id = :subscription_id"
+                + "      AND status = 'DELIVERED'::delivery_status)"
+                + " ON CONFLICT (event_id, subscription_id) WHERE " + LIVE_STATUS_PREDICATE
+                + " DO NOTHING"
+                + " RETURNING " + INSERT_COLUMNS;
+
+        List<Delivery> result = jdbcTemplate.query(sql, insertParams(delivery), insertRowMapper());
+        return result.isEmpty() ? Optional.empty() : Optional.of(result.get(0));
+    }
+
     private MapSqlParameterSource insertParams(Delivery delivery) {
         Map<String, Object> params = new HashMap<>();
         params.put("delivery_id", delivery.deliveryId());

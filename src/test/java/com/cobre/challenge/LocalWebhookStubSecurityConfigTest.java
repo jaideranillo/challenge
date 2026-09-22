@@ -45,8 +45,11 @@ class LocalWebhookStubSecurityConfigTest {
 
         @Test
         void unrelatedPathIsNotAccidentallyPermittedByTheStubFilterChain() throws Exception {
+            // TASK-008-21: SecurityConfig's terminal chain (ADR-007 §2, chain 4) denies every
+            // unlisted path with denyAll(), which yields 403, not the 401 the old
+            // authenticated()+httpBasic() catch-all produced.
             mockMvc.perform(get("/some-other-path"))
-                    .andExpect(status().isUnauthorized())
+                    .andExpect(status().isForbidden())
                     .andExpect(unauthenticated());
         }
     }
@@ -62,8 +65,11 @@ class LocalWebhookStubSecurityConfigTest {
 
         @Test
         void anyPathStillRequiresAuthenticationWhenLocalProfileIsNotActive() throws Exception {
+            // TASK-008-21: with no local-profile stub chain registered, this path falls through
+            // to SecurityConfig's terminal denyAll() chain (403), not the old authenticated()
+            // catch-all (401).
             mockMvc.perform(get("/local/webhook-stub/requests"))
-                    .andExpect(status().isUnauthorized());
+                    .andExpect(status().isForbidden());
         }
     }
 }

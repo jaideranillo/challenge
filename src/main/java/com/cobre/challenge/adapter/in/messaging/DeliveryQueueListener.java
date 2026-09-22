@@ -14,6 +14,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
@@ -54,6 +55,7 @@ class DeliveryQueueListener implements SmartLifecycle {
 
     private volatile boolean running;
 
+    @Autowired
     DeliveryQueueListener(
             SqsClient sqsClient,
             AttemptDeliveryUseCase attemptDeliveryUseCase,
