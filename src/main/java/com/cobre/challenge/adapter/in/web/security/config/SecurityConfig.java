@@ -34,8 +34,12 @@ import tools.jackson.databind.ObjectMapper;
  * fourth chain is a terminal {@code denyAll()} on {@code /**} — an unlisted path is dead on
  * arrival, not "whatever the last chain happened to say".
  *
- * <p>Order 4 is reserved for {@code local}-profile-only chains defined elsewhere
- * ({@code LocalWebhookStubSecurityConfig}); this class's terminal chain is pinned to
+ * <p>Orders 4+ are reserved for {@code local}-profile-only chains defined elsewhere
+ * ({@code LocalWebhookStubSecurityConfig}, {@code LocalEventGeneratorSecurityConfig}). Order 0 is
+ * also {@code local}-profile-only ({@code LocalIngestBypassSecurityConfig}, narrower than this
+ * class's own order-2 chain, permits {@code /internal/events/**} unauthenticated for the local
+ * demo generator — see that class's javadoc; it is not a stand-in for real producer auth). This
+ * class's terminal chain is pinned to
  * {@link Ordered#LOWEST_PRECEDENCE} so it is always evaluated last regardless of what else is
  * registered.
  *
