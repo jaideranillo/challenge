@@ -8,8 +8,50 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: false
+    # ADR-007 §5.4 / TASK-008-09: Flyway keeps its own credentials - a member of
+    # challenge_owner (V5) - rather than inheriting the primary DataSource's. That
+    # inheritance is exactly what made the runtime pipeline connection the table owner.
+    # Dev-only defaults mirror compose.yaml's already-committed POSTGRES_USER/PASSWORD;
+    # every deployed profile must supply its own via the environment.
+    user: ${CHALLENGE_DB_MIGRATION_USER:myuser}
+    password: ${CHALLENGE_DB_MIGRATION_PASSWORD:secret}
+    placeholders:
+      # V5's ALTER ROLE ... PASSWORD placeholders for challenge_pipeline/challenge_api.
+      # Same env vars back spring.datasource.password / challenge.security.api-datasource
+      # below, so the role V5 creates and the pool that later connects as it agree.
+      challengePipelinePassword: ${CHALLENGE_DB_PIPELINE_PASSWORD:challenge_pipeline_dev_password}
+      challengeApiPassword: ${CHALLENGE_DB_API_PASSWORD:challenge_api_dev_password}
+  datasource:
+    # ADR-007 §5.4 / TASK-008-09: the primary (pipeline) pool connects as
+    # challenge_pipeline - BYPASSRLS, no DDL (V5) - never as the table owner. The URL
+    # is still discovered via Docker Compose / Testcontainers service connection.
+    username: ${CHALLENGE_DB_PIPELINE_USER:challenge_pipeline}
+    password: ${CHALLENGE_DB_PIPELINE_PASSWORD:challenge_pipeline_dev_password}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # ADR-007 §7: production/staging trust anchor is JWKS from the corporate IdP only.
+          # No static-key property is set here in any form (see the `local` profile file for
+          # that; its presence outside local/test is a startup failure, §7 rule 1). The
+          # deployment must supply this value or the startup validator (TASK-008-22) refuses
+          # to boot on a blank issuer (§7 rule 2).
+          issuer-uri: ${CHALLENGE_JWT_ISSUER_URI:}
 
 challenge:
+  security:
+    api-datasource:
+      # ADR-007 §5.4 / TASK-008-09: the api pool connects as challenge_api - NOBYPASSRLS,
+      # SELECT only, subject to every RLS policy (V6). Its URL is derived at bean
+      # construction time from the primary DataSource (ApiDataSourceConfig), never
+      # configured here separately.
+      username: ${CHALLENGE_DB_API_USER:challenge_api}
+      password: ${CHALLENGE_DB_API_PASSWORD:challenge_api_dev_password}
+    jwt:
+      # ADR-007 §3: required in every profile; an absent audience is a startup failure.
+      audience: ${CHALLENGE_JWT_AUDIENCE:challenge-api}
+      # ADR-007 §3: exp - iat ceiling, a labelled proposal, not a measured number.
+      max-lifetime: 1h
   retry:
     backoff: 5s, 30s, 2m, 10m, 1h, 6h # ADR-004 SS1 production schedule
   relay:

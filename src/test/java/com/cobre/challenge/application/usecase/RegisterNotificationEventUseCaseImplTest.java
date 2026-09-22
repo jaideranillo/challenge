@@ -217,6 +217,12 @@ class RegisterNotificationEventUseCaseImplTest {
         }
 
         @Override
+        public Optional<Delivery> insertReplayIfAbsent(Delivery delivery) {
+            insertedDeliveries.add(delivery);
+            return Optional.of(delivery);
+        }
+
+        @Override
         public Optional<Delivery> findById(UUID deliveryId) {
             return insertedDeliveries.stream()
                     .filter(d -> d.deliveryId().equals(deliveryId))

@@ -4,6 +4,7 @@ import com.cobre.challenge.domain.policy.RetryPolicy;
 import java.time.Clock;
 import java.util.random.RandomGenerator;
 import java.util.random.RandomGeneratorFactory;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -18,6 +19,7 @@ import org.springframework.context.annotation.Configuration;
  * cryptographic generator, matching the "jitter, not a security control" requirement.
  */
 @Configuration
+@EnableConfigurationProperties(RetryProperties.class)
 public class RetryPolicyConfig {
 
 	@Bean

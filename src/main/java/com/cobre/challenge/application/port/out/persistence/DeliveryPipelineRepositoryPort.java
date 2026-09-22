@@ -57,6 +57,20 @@ public interface DeliveryPipelineRepositoryPort {
     Optional<Delivery> insertIfAbsent(Delivery delivery);
 
     /**
+     * Inserts a replay row unless a live row OR an already-{@code DELIVERED} row exists for
+     * {@code (event_id, subscription_id)} (ADR-005 §1's two 409 conditions), reporting either
+     * conflict as {@code Optional.empty()} rather than thrown.
+     *
+     * <p>Differs from {@link #insertIfAbsent(Delivery)} only in that a {@code DELIVERED} row
+     * also blocks the insert here; {@code insertIfAbsent}'s ingest semantics (a
+     * {@code DELIVERED} row frees the pair) are unchanged and unaffected by this method.
+     *
+     * @return the inserted {@link Delivery} as persisted, or {@code Optional.empty()} on a
+     *     live-pair or already-delivered conflict
+     */
+    Optional<Delivery> insertReplayIfAbsent(Delivery delivery);
+
+    /**
      * Loads the row the worker just claimed, without a tenant filter.
      *
      * <p>The worker must read {@code event_id}, {@code subscription_id}, the authoritative

@@ -10,8 +10,24 @@
 # challenge.egress.allowed-hosts is a demo-only egress exception for the
 # local stub receiver; it must never be set in any other profile. This
 # profile permits plaintext (HTTP) egress to allowlisted hosts only.
+# spring.security.oauth2.resourceserver.jwt.public-key-location/issuer-uri below
+# point at a static, publicly known test key (tools/dev-jwt/dev-public.pem) - it
+# has no security value and is valid nowhere but this local profile. Production
+# and staging use JWKS from the corporate IdP only and must never set
+# public-key-location (ADR-007 §7).
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: file:tools/dev-jwt/dev-public.pem
+          issuer-uri: http://localhost:8080/issuer/challenge-local
 
 challenge:
+  security:
+    jwt:
+      audience: challenge-api
   egress:
     # Local demo only. Waives BOTH the HTTPS requirement and the private-range
     # check for these hosts; applies only while the `local` profile is active.

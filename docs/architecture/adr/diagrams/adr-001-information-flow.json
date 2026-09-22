@@ -15,7 +15,7 @@
       "id": "producers",
       "type": "external",
       "label": "Platform Producers",
-      "sublabel": "platform event sources",
+      "sublabel": "event sources",
       "pos": [20, 50],
       "size": [150, 50]
     },
@@ -64,7 +64,7 @@
       "type": "backend",
       "label": "Relay / Dispatcher",
       "sublabel": "SKIP LOCKED claim",
-      "pos": [605, 180],
+      "pos": [605, 140],
       "size": [150, 50]
     },
     {
@@ -72,7 +72,7 @@
       "type": "messagebus",
       "label": "DLQ",
       "sublabel": "maxReceiveCount exceeded",
-      "pos": [800, 180],
+      "pos": [800, 140],
       "size": [150, 50]
     },
     {
@@ -80,7 +80,7 @@
       "type": "external",
       "label": "Client Webhook",
       "sublabel": "client HTTPS endpoint",
-      "pos": [1190, 180],
+      "pos": [1190, 140],
       "size": [150, 50]
     },
     {
@@ -88,7 +88,7 @@
       "type": "backend",
       "label": "DLQ Consumer",
       "sublabel": "sole writer of FAILED",
-      "pos": [800, 310],
+      "pos": [800, 270],
       "size": [150, 50]
     },
     {
@@ -96,7 +96,7 @@
       "type": "database",
       "label": "notification_events",
       "sublabel": "the platform event, immutable",
-      "pos": [350, 440],
+      "pos": [350, 400],
       "size": [165, 85]
     },
     {
@@ -104,15 +104,7 @@
       "type": "database",
       "label": "deliveries",
       "sublabel": "outbox: sole source of truth",
-      "pos": [545, 440],
-      "size": [165, 85]
-    },
-    {
-      "id": "subscriptions",
-      "type": "database",
-      "label": "subscriptions",
-      "sublabel": "URL, secret ref, breaker state",
-      "pos": [740, 440],
+      "pos": [545, 400],
       "size": [165, 85]
     },
     {
@@ -120,7 +112,15 @@
       "type": "database",
       "label": "delivery_attempts",
       "sublabel": "one row per HTTP attempt",
-      "pos": [935, 440],
+      "pos": [740, 400],
+      "size": [165, 85]
+    },
+    {
+      "id": "subscriptions",
+      "type": "database",
+      "label": "subscriptions",
+      "sublabel": "URL, secret, breaker",
+      "pos": [935, 400],
       "size": [165, 85]
     },
     {
@@ -128,7 +128,7 @@
       "type": "external",
       "label": "API Client",
       "sublabel": "tenant caller",
-      "pos": [20, 565],
+      "pos": [20, 585],
       "size": [150, 50]
     },
     {
@@ -136,7 +136,7 @@
       "type": "cloud",
       "label": "Edge / API Gateway",
       "sublabel": "WAF, rate limit, TLS",
-      "pos": [215, 565],
+      "pos": [215, 585],
       "size": [190, 50]
     },
     {
@@ -144,15 +144,15 @@
       "type": "security",
       "label": "SecurityFilterChain",
       "sublabel": "JWT RS256, rate limit after auth, TenantId resolver",
-      "pos": [430, 550],
+      "pos": [430, 570],
       "size": [340, 80]
     },
     {
       "id": "self_service_api",
       "type": "backend",
       "label": "Self-Service API",
-      "sublabel": "reads deliveries, replays via insert",
-      "pos": [900, 565],
+      "sublabel": "read + replay",
+      "pos": [900, 585],
       "size": [170, 50]
     }
   ],
@@ -197,7 +197,7 @@
       "label": "INSERT event + content (1 txn)",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelAt": [340, 270]
+      "labelAt": [340, 230]
     },
     {
       "from": "event_gateway",
@@ -205,17 +205,17 @@
       "label": "INSERT N rows PENDING (same txn)",
       "fromSide": "bottom",
       "toSide": "top",
-      "via": [[485, 393], [627.5, 393]],
-      "labelAt": [530, 320]
+      "via": [[485, 353], [627.5, 353]],
+      "labelAt": [530, 280]
     },
     {
       "from": "event_gateway",
       "to": "subscriptions",
       "label": "READ active subscription (tenant-scoped)",
-      "fromSide": "right",
-      "toSide": "top",
-      "via": [[560, 75], [777, 75], [777, 400], [822.5, 400]],
-      "labelAt": [700, 75]
+      "fromSide": "top",
+      "toSide": "right",
+      "via": [[485, 15], [1355, 15], [1355, 442.5]],
+      "labelAt": [900, 15]
     },
     {
       "from": "event_gateway",
@@ -229,8 +229,8 @@
       "label": "UPDATE -> QUEUED (SKIP LOCKED claim)",
       "fromSide": "bottom",
       "toSide": "top",
-      "via": [[680, 428], [627.5, 428]],
-      "labelAt": [600, 340]
+      "via": [[680, 388], [627.5, 388]],
+      "labelAt": [600, 300]
     },
     {
       "from": "relay",
@@ -241,20 +241,20 @@
       "from": "sqs",
       "to": "delivery_worker",
       "label": "long-poll receive",
-      "labelAt": [960, 150]
+      "labelAt": [960, 115]
     },
     {
       "from": "delivery_worker",
       "to": "gate",
       "label": "attempt via gate",
-      "labelDy": 55,
+      "labelDy": 45,
       "variant": "emphasis"
     },
     {
       "from": "gate",
       "to": "client_webhook",
-      "label": "outbound webhook (6-step backoff, jitter)",
-      "labelDy": 24,
+      "label": "outbound webhook call",
+      "labelDy": 20,
       "variant": "emphasis"
     },
     {
@@ -263,16 +263,17 @@
       "label": "INSERT per HTTP attempt",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelAt": [1100, 320]
+      "via": [[1070, 350], [822.5, 350]],
+      "labelAt": [1150, 350]
     },
     {
       "from": "delivery_worker",
       "to": "deliveries",
-      "label": "UPDATE QUEUED->PROCESSING->DELIVERED/RETRYING/DEAD",
+      "label": "UPDATE delivery status",
       "fromSide": "bottom",
       "toSide": "top",
-      "via": [[1070, 408], [627.5, 408]],
-      "labelAt": [850, 408]
+      "via": [[1070, 362], [627.5, 362]],
+      "labelAt": [910, 370]
     },
     {
       "from": "delivery_worker",
@@ -280,8 +281,7 @@
       "label": "READ URL+secret; UPDATE on 404/410/429",
       "fromSide": "bottom",
       "toSide": "top",
-      "via": [[1070, 402], [822.5, 402]],
-      "labelAt": [950, 424]
+      "labelAt": [1200, 430]
     },
     {
       "from": "sqs",
@@ -304,7 +304,8 @@
       "label": "UPDATE -> FAILED (sole writer)",
       "fromSide": "bottom",
       "toSide": "top",
-      "labelAt": [800, 470]
+      "via": [[875, 340], [627.5, 340]],
+      "labelAt": [580, 340]
     },
     {
       "from": "api_client",
@@ -317,14 +318,15 @@
       "to": "filter_chain",
       "label": "TLS + rate limit",
       "variant": "security",
-      "labelDy": -45
+      "labelDx": -70,
+      "labelDy": -18
     },
     {
       "from": "filter_chain",
       "to": "self_service_api",
       "label": "TenantId (mandatory)",
       "variant": "security",
-      "labelDy": -45
+      "labelDy": -18
     },
     {
       "from": "self_service_api",
@@ -332,26 +334,26 @@
       "label": "READ (full attempt history)",
       "fromSide": "top",
       "toSide": "bottom",
-      "via": [[985, 552], [1017.5, 552]],
-      "labelAt": [1060, 552]
+      "via": [[985, 508], [822.5, 508]],
+      "labelAt": [1030, 508]
     },
     {
       "from": "self_service_api",
       "to": "deliveries",
       "label": "GET (READ) / POST /replay -> INSERT new row",
-      "fromSide": "left",
+      "fromSide": "top",
       "toSide": "bottom",
-      "via": [[820, 590], [820, 540], [627.5, 540]],
-      "labelAt": [740, 540]
+      "via": [[985, 520], [627.5, 520]],
+      "labelAt": [700, 514]
     },
     {
       "from": "self_service_api",
       "to": "notification_events",
       "label": "READ (joined for event body)",
-      "fromSide": "left",
+      "fromSide": "top",
       "toSide": "bottom",
-      "via": [[800, 590], [800, 533], [432.5, 533]],
-      "labelAt": [560, 533]
+      "via": [[985, 532], [432.5, 532]],
+      "labelAt": [500, 526]
     }
   ],
   "cards": [

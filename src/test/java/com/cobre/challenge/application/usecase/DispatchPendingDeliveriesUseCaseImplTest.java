@@ -156,6 +156,12 @@ class DispatchPendingDeliveriesUseCaseImplTest {
         }
 
         @Override
+        public Optional<Delivery> insertReplayIfAbsent(Delivery delivery) {
+            writeCalls++;
+            return Optional.of(delivery);
+        }
+
+        @Override
         public Optional<Delivery> findById(UUID deliveryId) {
             return Optional.empty();
         }
