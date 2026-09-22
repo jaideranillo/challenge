@@ -1,0 +1,483 @@
+{
+  "id": null,
+  "uid": "notification-delivery",
+  "title": "Notification Delivery",
+  "description": "FEAT-009 / ADR-008 observability dashboard for the notification delivery pipeline. Panels 1-8 are Prometheus (via the otel-lgtm image's provisioned 'prometheus' datasource); panel 9 is the Loki/Tempo trace-and-log correlation ADR-008 §2/§3.1 wires up. Metric series names and datasource UIDs were confirmed against the running grafana/otel-lgtm stack (TASK-009-07), not transliterated from meter names.",
+  "tags": [
+    "feat-009",
+    "notification-delivery"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "delivery_id",
+        "type": "textbox",
+        "label": "delivery_id",
+        "description": "Loki/log-only drill-down dimension (ADR-008 §4.3). Never a metric label. Leave blank to match all.",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      },
+      {
+        "name": "event_id",
+        "type": "textbox",
+        "label": "event_id",
+        "description": "Loki/log-only drill-down dimension (ADR-008 §4.3). Never a metric label. Leave blank to match all.",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      },
+      {
+        "name": "client_id",
+        "type": "textbox",
+        "label": "client_id",
+        "description": "Loki/log-only drill-down dimension (ADR-008 §4.3). Never a metric label - unbounded cardinality, denied outright by the MeterFilter. Leave blank to match all.",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      },
+      {
+        "name": "subscription_id",
+        "type": "textbox",
+        "label": "subscription_id",
+        "description": "Loki/log-only drill-down dimension (ADR-008 §4.3). Never a metric label. Leave blank to match all.",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Delivery attempt pipeline",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Delivery attempt latency percentiles (p50 / p90 / p99)",
+      "description": "ADR-008 §4.2: percentiles computed at query time from the notification.delivery.attempt.latency histogram buckets, never a client-side-precomputed quantile series. Buckets: 100ms,250ms,500ms,1s,2s,5s,7s,10s. A p99 above 5s (the worker read-timeout) is the signal, not a rendering artefact.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(notification_delivery_attempt_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.90, sum(rate(notification_delivery_attempt_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(notification_delivery_attempt_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Delivery attempt latency by outcome / status_class",
+      "description": "ADR-008 §4.1: the only two tags this timer carries. Average latency (rate(sum)/rate(count)) grouped by outcome and status_class - no other dimension is ever added.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(notification_delivery_attempt_latency_milliseconds_sum[$__rate_interval])) by (outcome, status_class) / sum(rate(notification_delivery_attempt_latency_milliseconds_count[$__rate_interval])) by (outcome, status_class)",
+          "legendFormat": "{{outcome}} / {{status_class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Relay dispatch latency percentiles",
+      "description": "ADR-008 §4.2: notification.relay.dispatch.latency, untagged, buckets 50ms,100ms,250ms,500ms,1s,2s,5s. Threshold line at challenge.relay.poll-interval (5s) - a cycle above it is the signal, a rendering choice, not an alert (ADR-008 §6 defers alerts).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(notification_relay_dispatch_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.90, sum(rate(notification_relay_dispatch_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(notification_relay_dispatch_latency_milliseconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "DLQ arrival rate",
+      "description": "notification.delivery.dlq.arrival is a counter (renamed from delivery.dlq.arrival by TASK-009-03) and resets on process restart - this renders rate(), never the raw monotonic total.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(notification_delivery_dlq_arrival_total[$__rate_interval]))",
+          "legendFormat": "DLQ arrivals/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "DLQ depth",
+      "description": "notification.delivery.dlq.depth is a gauge polled from SQS GetQueueAttributes (ADR-008 §4.1.1). It goes STALE (holds its last value) on a failed poll and is NaN if it has never succeeded once - a flat line here is NOT automatically \"the DLQ is fine\"; check the app's poll-failure logs/traces before reading a flat line as healthy.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "notification_delivery_dlq_depth",
+          "legendFormat": "DLQ depth",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "HTTP surface (ingest and self-service)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "collapsed": false
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Ingest request rate and latency (p99)",
+      "description": "http.server.requests, uri=/internal/events. ADR-008 §4.1: no bespoke ingest timer exists; this Boot-default timer is the ingest latency meter.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_milliseconds_count{uri=\"/internal/events\"}[$__rate_interval]))",
+          "legendFormat": "requests/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_requests_milliseconds_bucket{uri=\"/internal/events\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99 latency (ms)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Self-service request rate and latency (p99)",
+      "description": "http.server.requests restricted to the three delivered self-service paths (templated uri tag, not the expanded one): /notification_events, /notification_events/{notification_event_id}, /notification_events/{notification_event_id}/replay.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_milliseconds_count{uri=~\"/notification_events|/notification_events/\\\\{notification_event_id\\\\}|/notification_events/\\\\{notification_event_id\\\\}/replay\"}[$__rate_interval])) by (uri)",
+          "legendFormat": "{{uri}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_requests_milliseconds_bucket{uri=~\"/notification_events|/notification_events/\\\\{notification_event_id\\\\}|/notification_events/\\\\{notification_event_id\\\\}/replay\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99 latency (ms)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ingest and self-service error rate (4xx vs 5xx)",
+      "description": "http.server.requests split by status/outcome. A client's 4xx and the service's 5xx are different operational events and are never merged into one series.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_milliseconds_count{uri=~\"/internal/events|/notification_events.*\", outcome=\"CLIENT_ERROR\"}[$__rate_interval])) by (uri, status)",
+          "legendFormat": "4xx {{uri}} ({{status}})",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_milliseconds_count{uri=~\"/internal/events|/notification_events.*\", outcome=\"SERVER_ERROR\"}[$__rate_interval])) by (uri, status)",
+          "legendFormat": "5xx {{uri}} ({{status}})",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Trace and log correlation",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      },
+      "collapsed": false
+    },
+    {
+      "id": 12,
+      "type": "logs",
+      "title": "Delivery pipeline logs (click a trace_id to pivot into Tempo)",
+      "description": "OTLP log records in Loki. Each line carries trace_id/span_id attached by the appender from the live OTel context (ADR-008 §3.2, never hand-set); the Loki datasource's provisioned derived field turns trace_id into a link to Tempo, so a log line opens the same waterfall that spans ingest, relay dispatch and the delivery attempt across the SQS hop (§2). Optional filters below use the MDC keys §3.2 puts on every line (delivery_id, event_id, client_id, subscription_id) - the per-client drill-down path §4.3 states is a Loki/Tempo operation, never a metric label. content and response_excerpt are excluded from every query on this dashboard: §3.3 keeps them out of the log store entirely.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{service_name=\"challenge\"} | delivery_id=~\"${delivery_id:regex}.*\" | event_id=~\"${event_id:regex}.*\" | client_id=~\"${client_id:regex}.*\" | subscription_id=~\"${subscription_id:regex}.*\"",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

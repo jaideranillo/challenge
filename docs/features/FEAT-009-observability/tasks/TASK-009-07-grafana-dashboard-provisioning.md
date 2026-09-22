@@ -225,4 +225,34 @@ closing note, and stop — the user reviews the working tree and commits.
 
 ## Status
 
-Not Started <!-- Not Started | In Progress | Ready for Review | Done (Done is set by the user only) -->
+Ready for Review <!-- Not Started | In Progress | Ready for Review | Done (Done is set by the user only) -->
+
+## Closing note (Harbor, devops-engineer)
+
+**Files.** `docker/grafana/dashboards/notification-delivery.json` created (new). `docker/grafana/provisioning/dashboards/dashboards.yaml` and both `compose.yaml` read-only bind mounts already existed in the working tree before this session (a prior, unfinished pass at this task) and were verified correct as-is; no edit was needed to either.
+
+**1. Verified container-side provisioning path.** Confirmed live, not assumed: the dashboard provider file is mounted read-only at `/otel-lgtm/grafana/conf/provisioning/dashboards/dashboards.yaml` (already recorded by the existing file's own header comment) and the dashboard JSON directory at `/otel-lgtm/custom-dashboards:ro`. Proof: after adding only the JSON file to the host directory (container already running, no restart), `docker exec challenge-grafana-lgtm-1 ls /otel-lgtm/custom-dashboards/` showed the new file, and `GET http://localhost:3000/api/search?query=Notification` returned it immediately — auto-discovered with no manual import and no container restart.
+
+**2. Verified live metric series names and datasource UIDs**, via `GET /api/datasources` and the Prometheus label API proxied through Grafana (`/api/datasources/proxy/uid/prometheus/api/v1/label/__name__/values`):
+- Datasource UIDs (provisioned by the image itself, unchanged by this task): `prometheus`, `loki`, `tempo`.
+- OTLP ingest into Mimir/Prometheus rewrites Micrometer timer names to **`_milliseconds_...`**, not `_seconds_...` — the ADR's ms-scale bucket boundaries carry straight through, but do not transliterate as `_seconds_bucket`. Confirmed series:
+  - `http_server_requests_milliseconds_bucket` / `_count` / `_sum`, tags `uri`, `method`, `status`, `outcome` — confirmed live values `uri="/internal/events"`, `uri="/notification_events"`, `uri="/notification_events/{notification_event_id}"`, `uri="/notification_events/{notification_event_id}/replay"` (templated, not expanded), `outcome="CLIENT_ERROR"|"SERVER_ERROR"|"SUCCESS"`.
+  - `notification_relay_dispatch_latency_milliseconds_bucket` / `_count` / `_sum`, untagged — confirmed populated (122 samples during this session; recorded every poll cycle regardless of claim count).
+  - `notification_delivery_dlq_arrival_total` (counter) — confirmed present, tag-free, value 0 (no arrivals this session).
+  - `notification_delivery_dlq_depth` (gauge) — confirmed present, tag-free, value 0 (successful `GetQueueAttributes` poll, not stale/NaN).
+  - `notification_delivery_attempt_latency_milliseconds_*` — name pattern confirmed by consistency with its sibling timer (`JdkWebhookClientAdapter` registers it under the same `notification.delivery.attempt.latency` id that becomes `notification_relay_dispatch_latency_*` for the sibling meter), but **no sample has ever been recorded this session** — see blocker below. Panels 1/2 are written against this confirmed name pattern and will render once the blocker is fixed.
+  - A stale `delivery_dlq_arrival_total` (pre-rename name) appeared once in the `__name__` label listing but returns an empty result set on `query` — a leftover series name from before TASK-009-03's rename, with no live data; not used by any panel.
+
+**Two blockers found during live verification, both out of this task's scope (no Java/SQL/YAML touched):**
+
+1. **The relay never claims any delivery**, so no delivery attempt ever happens and panels 1 and 2 cannot show data no matter how long the stack runs. Root cause, read directly from `DeliveryPipelineJdbcRepository.claimDue`: the due-predicate is `d.next_attempt_at <= :as_of` with no `IS NULL` branch, but a freshly-inserted `PENDING` delivery has `next_attempt_at = NULL` by design (confirmed against `V2__deliveries.sql`'s own column comment: "Drives the relay due-query... Set to NULL on the DEAD transition" — NULL is a normal, expected state, not only a terminal one). `NULL <= x` is never true in SQL, so every fresh delivery is permanently unclaimable. Verified directly in Postgres: 41 `PENDING` rows, all several minutes old (past the 30s grace), 0 matched by `next_attempt_at <= now()`, all 41 matched once `next_attempt_at IS NULL OR next_attempt_at <= now()` is added. This is a backend/DBA-owned bug in delivery claiming, unrelated to FEAT-009 dashboards — reporting it back rather than fixing it here, per this task's explicit out-of-scope rule.
+2. **No log record has ever reached Loki.** Traces reach Tempo correctly (confirmed live: `deliveryRelayScheduler.pollOnce` and `dlqDepthGauge.pollDepth` root spans present in Tempo's search API) and metrics reach Prometheus correctly, but `GET /loki/api/v1/labels` returns zero labels and no otelcol receiver metric for logs exists at all — the OTLP log export path (ADR-008 §3.1) is not delivering anything from this app run, for a reason not diagnosed further here (out of scope to chase into Java/config). Panel 9's LogQL was verified to be syntactically valid (`query_range` returns `"status":"success"` with an empty result set, not a parse error) and its Loki→Tempo trace-id link relies on the datasource's own already-provisioned `derivedFields` config (untouched, image default) — but it cannot be visually confirmed end-to-end until log export is fixed.
+
+**Panel-by-panel verification result** (`make up`, local profile, 60 synthetic ingest events via `/local/event-generator/generate` plus manual self-service/replay/404 traffic):
+- Render real data, confirmed live: panels 3 (relay dispatch latency), 4 (DLQ arrival rate — flat 0, a real series not "no data"), 5 (DLQ depth — real 0, not stale/NaN), 6 (ingest rate/latency), 7 (self-service rate/latency), 8 (error rate).
+- Do **not** render data, blocked by item 1 above: panels 1, 2.
+- Cannot be visually confirmed end-to-end, blocked by item 2 above: panel 9 (query is valid; no rows exist to click through).
+
+**Also noticed, not touched:** `src/main/resources/application.yaml`'s `management.metrics.distribution.slo` block has a `maximum-expected-value` entry commented out under a `TEMP-VERIFICATION-ONLY (TASK-009-07)` note asking for it to be restored "before finishing." That file is untouched by this task (out of scope) and the comment predates this session (already committed, no local diff) — flagging it here so whoever owns `application.yaml` restores it.
+
+**Definition of Done:** dashboard + provisioning + compose mounts all in place and verified provisioning end-to-end; 6 of 9 panels confirmed rendering real data against live traffic; 3 panels (1, 2, 9) are correctly written but blocked by pre-existing pipeline/log-export defects outside this task's scope, reported above rather than fixed. No `git add`/`git commit` run. No `./gradlew build` run.
