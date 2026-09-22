@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.micrometer.tracing.Span;
 import io.micrometer.tracing.TraceContext;
 import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
+import java.util.List;
 import java.util.Optional;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
@@ -18,7 +20,7 @@ class MicrometerTraceContextAdapterTest {
     @Test
     void returnsW3cTraceparentCarryingTheActiveSpanTraceId() {
         Tracer tracer = new StubTracer(new StubSpan(TRACE_ID, SPAN_ID, true));
-        MicrometerTraceContextAdapter adapter = new MicrometerTraceContextAdapter(tracer);
+        MicrometerTraceContextAdapter adapter = new MicrometerTraceContextAdapter(tracer, new W3cLikePropagator());
 
         Optional<String> traceparent = adapter.currentTraceparent();
 
@@ -29,9 +31,29 @@ class MicrometerTraceContextAdapterTest {
     @Test
     void returnsEmptyWithNoActiveSpan() {
         Tracer tracer = new StubTracer(null);
-        MicrometerTraceContextAdapter adapter = new MicrometerTraceContextAdapter(tracer);
+        MicrometerTraceContextAdapter adapter = new MicrometerTraceContextAdapter(tracer, new W3cLikePropagator());
 
         assertThat(adapter.currentTraceparent()).isEmpty();
+    }
+
+    /** Stands in for the Boot-configured W3C propagator. */
+    private static final class W3cLikePropagator implements Propagator {
+
+        @Override
+        public List<String> fields() {
+            return List.of("traceparent");
+        }
+
+        @Override
+        public <C> void inject(TraceContext context, C carrier, Setter<C> setter) {
+            String flags = Boolean.TRUE.equals(context.sampled()) ? "01" : "00";
+            setter.set(carrier, "traceparent", "00-" + context.traceId() + "-" + context.spanId() + "-" + flags);
+        }
+
+        @Override
+        public <C> Span.Builder extract(C carrier, Getter<C> getter) {
+            throw new UnsupportedOperationException("not used by this adapter");
+        }
     }
 
     /**

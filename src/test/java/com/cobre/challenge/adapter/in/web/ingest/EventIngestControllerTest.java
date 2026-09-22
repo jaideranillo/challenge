@@ -11,8 +11,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.cobre.challenge.application.port.in.pipeline.RegisterNotificationEventUseCase;
 import com.cobre.challenge.application.port.in.pipeline.dto.RegisterNotificationEventCommand;
 import com.cobre.challenge.application.port.in.pipeline.dto.RegisterNotificationEventResult;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import java.util.List;
 import java.util.UUID;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -34,6 +37,16 @@ class EventIngestControllerTest {
 
     @MockitoBean
     private RegisterNotificationEventUseCase useCase;
+
+    @MockitoBean
+    private Tracer tracer;
+
+    // Constructor injection just needs a usable Tracer bean; the span itself is not under test.
+    @BeforeEach
+    void stubTracer() {
+        when(tracer.nextSpan()).thenReturn(Span.NOOP);
+        when(tracer.withSpan(any())).thenReturn(() -> { });
+    }
 
     @Test
     void returns202WithDeliveryIdsAndNewlyCreatedTrueForANormalIngest() throws Exception {

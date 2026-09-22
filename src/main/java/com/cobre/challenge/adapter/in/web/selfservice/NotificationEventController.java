@@ -17,6 +17,7 @@ import com.cobre.challenge.application.usecase.config.SelfServiceQueryProperties
 import com.cobre.challenge.domain.model.tenant.TenantId;
 import jakarta.validation.Valid;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -47,18 +48,21 @@ public class NotificationEventController {
     private final ReplayDeliveryUseCase replayUseCase;
     private final ReplayIdempotencyGuard idempotencyGuard;
     private final SelfServiceQueryProperties queryProperties;
+    private final ReplaySpanRecorder replaySpanRecorder;
 
     public NotificationEventController(
             QueryNotificationEventsUseCase queryUseCase,
             GetNotificationEventUseCase getUseCase,
             ReplayDeliveryUseCase replayUseCase,
             ReplayIdempotencyGuard idempotencyGuard,
-            SelfServiceQueryProperties queryProperties) {
+            SelfServiceQueryProperties queryProperties,
+            ReplaySpanRecorder replaySpanRecorder) {
         this.queryUseCase = queryUseCase;
         this.getUseCase = getUseCase;
         this.replayUseCase = replayUseCase;
         this.idempotencyGuard = idempotencyGuard;
         this.queryProperties = queryProperties;
+        this.replaySpanRecorder = replaySpanRecorder;
     }
 
     @PreAuthorize("hasAuthority('notifications:read')")
@@ -101,18 +105,27 @@ public class NotificationEventController {
             return ResponseEntity.badRequest().body(null);
         }
 
-        return idempotencyGuard.executeOrReplay(tenant, notificationEventId, idempotencyKey, () -> {
-            ReplayDeliveryCommand command = new ReplayDeliveryCommand(notificationEventId, tenant, idempotencyKey);
-            ReplayDeliveryResult result = replayUseCase.replay(command);
-            return switch (result) {
-                case Accepted accepted ->
-                    ResponseEntity.status(HttpStatus.ACCEPTED).body(ReplayAcceptedResponse.from(accepted));
-                case Rejected rejected -> switch (rejected.reason()) {
-                    case TARGET_NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(null);
-                    case TARGET_NOT_DEAD, LIVE_OR_DELIVERED_ROW_ALREADY_EXISTS ->
-                        ResponseEntity.status(HttpStatus.CONFLICT).body(null);
-                };
-            };
-        });
+        AtomicReference<ReplayDeliveryResult> resultHolder = new AtomicReference<>();
+        ResponseEntity<Object> response =
+                idempotencyGuard.executeOrReplay(tenant, notificationEventId, idempotencyKey, () -> {
+                    ReplayDeliveryCommand command =
+                            new ReplayDeliveryCommand(notificationEventId, tenant, idempotencyKey);
+                    ReplayDeliveryResult result = replayUseCase.replay(command);
+                    resultHolder.set(result);
+                    return switch (result) {
+                        case Accepted accepted ->
+                            ResponseEntity.status(HttpStatus.ACCEPTED).body(ReplayAcceptedResponse.from(accepted));
+                        case Rejected rejected -> switch (rejected.reason()) {
+                            case TARGET_NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(null);
+                            case TARGET_NOT_DEAD, LIVE_OR_DELIVERED_ROW_ALREADY_EXISTS ->
+                                ResponseEntity.status(HttpStatus.CONFLICT).body(null);
+                        };
+                    };
+                });
+
+        if (resultHolder.get() instanceof Accepted accepted) {
+            replaySpanRecorder.record(notificationEventId, accepted.originalTraceContext());
+        }
+        return response;
     }
 }

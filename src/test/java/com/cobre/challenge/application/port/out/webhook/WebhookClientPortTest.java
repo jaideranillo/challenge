@@ -27,7 +27,7 @@ class WebhookClientPortTest {
     @Test
     void webhookResponseFeedsResponseClassifierDirectly() {
         WebhookResponse response = new WebhookResponse(
-                200, TransportFailure.NONE, 120, Optional.empty(), Optional.empty());
+                200, TransportFailure.NONE, 120, Optional.empty(), 0, Optional.empty());
 
         assertThat(ResponseClassifier.classify(response.statusCode(), response.failure()))
                 .isEqualTo(AttemptOutcome.SUCCESS);
@@ -35,7 +35,7 @@ class WebhookClientPortTest {
 
     @Test
     void webhookResponseRejectsNullFailure() {
-        assertThatThrownBy(() -> new WebhookResponse(0, null, 0, Optional.empty(), Optional.empty()))
+        assertThatThrownBy(() -> new WebhookResponse(0, null, 0, Optional.empty(), 0, Optional.empty()))
                 .isInstanceOf(NullPointerException.class);
     }
 }

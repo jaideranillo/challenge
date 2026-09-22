@@ -38,6 +38,47 @@ spring:
           # to boot on a blank issuer (§7 rule 2).
           issuer-uri: ${CHALLENGE_JWT_ISSUER_URI:}
 
+management:
+  # ADR-008 §3.1: OTLP log export over the connection already service-connected for traces and
+  # metrics (spring-boot-docker-compose / Testcontainers auto-detect the grafana/otel-lgtm image
+  # for logging the same way they already do for tracing and metrics - no endpoint is set here).
+  # Boot 4.1.1 key confirmed against spring-boot-opentelemetry-4.1.1.jar's
+  # META-INF/spring-configuration-metadata.json: management.otlp.logging.export.enabled is
+  # deprecated (error level, since 4.0.0) in favor of this key. Default is already true; set
+  # explicitly so the decision is visible in source rather than inherited silently.
+  logging:
+    export:
+      otlp:
+        enabled: true
+  endpoint:
+    health:
+      # ADR-008 §5: local-only deployment, no Kubernetes. probes.enabled exposes the
+      # liveness/readiness groups below; show-details stays never (A02, unchanged security posture).
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db
+  metrics:
+    distribution:
+      # ADR-008 §4.2: histograms + SLO buckets enabled per meter, never globally
+      # (percentiles-histogram.all is not set). Only bucket boundaries are published, never
+      # client-side percentiles=... - Mimir/Grafana compute quantiles at query time.
+      percentiles-histogram:
+        "[notification.delivery.attempt.latency]": true
+        "[notification.relay.dispatch.latency]": true
+        "[http.server.requests]": true
+      slo:
+        "[notification.delivery.attempt.latency]": 100ms,250ms,500ms,1s,2s,5s,7s,10s
+        "[notification.relay.dispatch.latency]": 50ms,100ms,250ms,500ms,1s,2s,5s
+      # TEMP-VERIFICATION-ONLY (TASK-009-07): commented out to unblock live verification of
+      # Prometheus series names, restore before finishing per Harbor's out-of-scope rule.
+      # maximum-expected-value:
+      #   "[http.server.requests]": 10s
+
 challenge:
   security:
     api-datasource:

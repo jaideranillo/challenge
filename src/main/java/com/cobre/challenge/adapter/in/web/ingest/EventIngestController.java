@@ -4,6 +4,8 @@ import com.cobre.challenge.adapter.in.web.ingest.dto.IngestEventRequest;
 import com.cobre.challenge.adapter.in.web.ingest.dto.IngestEventResponse;
 import com.cobre.challenge.application.port.in.pipeline.RegisterNotificationEventUseCase;
 import com.cobre.challenge.application.port.in.pipeline.dto.RegisterNotificationEventResult;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -30,15 +32,27 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/internal/events")
 public class EventIngestController {
 
-    private final RegisterNotificationEventUseCase useCase;
+    private static final String SPAN_INGEST = "notification.ingest";
 
-    public EventIngestController(RegisterNotificationEventUseCase useCase) {
+    private final RegisterNotificationEventUseCase useCase;
+    private final Tracer tracer;
+
+    public EventIngestController(RegisterNotificationEventUseCase useCase, Tracer tracer) {
         this.useCase = useCase;
+        this.tracer = tracer;
     }
 
     @PostMapping
     public ResponseEntity<IngestEventResponse> ingest(@Valid @RequestBody IngestEventRequest request) {
-        RegisterNotificationEventResult result = useCase.register(request.toCommand());
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(IngestEventResponse.from(result));
+        Span span = tracer.nextSpan().name(SPAN_INGEST).start();
+        try (Tracer.SpanInScope scope = tracer.withSpan(span)) {
+            RegisterNotificationEventResult result = useCase.register(request.toCommand());
+            return ResponseEntity.status(HttpStatus.ACCEPTED).body(IngestEventResponse.from(result));
+        } catch (RuntimeException e) {
+            span.error(e);
+            throw e;
+        } finally {
+            span.end();
+        }
     }
 }

@@ -8,6 +8,7 @@ import com.cobre.challenge.application.port.in.selfservice.dto.RejectionReason;
 import com.cobre.challenge.application.port.in.selfservice.dto.ReplayDeliveryCommand;
 import com.cobre.challenge.application.port.out.persistence.DeliveryPipelineRepositoryPort;
 import com.cobre.challenge.application.port.out.persistence.DeliveryQueryRepositoryPort;
+import com.cobre.challenge.application.port.out.tracing.TraceContextPort;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryOrigin;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
@@ -37,11 +38,15 @@ public class ReplayDeliveryUseCaseImpl implements ReplayDeliveryUseCase {
 
     private final DeliveryQueryRepositoryPort deliveryQueryRepository;
     private final DeliveryPipelineRepositoryPort pipelineRepository;
+    private final TraceContextPort traceContextPort;
 
     public ReplayDeliveryUseCaseImpl(
-            DeliveryQueryRepositoryPort deliveryQueryRepository, DeliveryPipelineRepositoryPort pipelineRepository) {
+            DeliveryQueryRepositoryPort deliveryQueryRepository,
+            DeliveryPipelineRepositoryPort pipelineRepository,
+            TraceContextPort traceContextPort) {
         this.deliveryQueryRepository = deliveryQueryRepository;
         this.pipelineRepository = pipelineRepository;
+        this.traceContextPort = traceContextPort;
     }
 
     @Override
@@ -69,14 +74,14 @@ public class ReplayDeliveryUseCaseImpl implements ReplayDeliveryUseCase {
                 Optional.empty(),
                 Optional.empty(),
                 target.eventCreatedAt(),
-                Optional.empty());
+                traceContextPort.currentTraceparent());
 
         Optional<Delivery> inserted = pipelineRepository.insertReplayIfAbsent(replayRow);
         if (inserted.isEmpty()) {
             return new Rejected(RejectionReason.LIVE_OR_DELIVERED_ROW_ALREADY_EXISTS);
         }
 
-        return new Accepted(inserted.get().deliveryId(), inserted.get().status());
+        return new Accepted(inserted.get().deliveryId(), inserted.get().status(), target.traceContext());
     }
 
     /**

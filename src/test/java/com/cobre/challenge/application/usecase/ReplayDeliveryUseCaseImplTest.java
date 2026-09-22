@@ -11,6 +11,7 @@ import com.cobre.challenge.application.port.out.persistence.DeliveryPipelineRepo
 import com.cobre.challenge.application.port.out.persistence.DeliveryQueryRepositoryPort;
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPage;
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPageQuery;
+import com.cobre.challenge.application.port.out.tracing.TraceContextPort;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryOrigin;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
@@ -32,15 +33,17 @@ class ReplayDeliveryUseCaseImplTest {
 
     private final FakeDeliveryQueryRepository deliveryQueryRepository = new FakeDeliveryQueryRepository();
     private final FakePipelineRepository pipelineRepository = new FakePipelineRepository();
+    private final FakeTraceContextPort traceContextPort = new FakeTraceContextPort();
 
     private final ReplayDeliveryUseCaseImpl useCase =
-            new ReplayDeliveryUseCaseImpl(deliveryQueryRepository, pipelineRepository);
+            new ReplayDeliveryUseCaseImpl(deliveryQueryRepository, pipelineRepository, traceContextPort);
 
     @Test
     void deadTargetInsertsAReplayRowAndReturnsAccepted() {
         UUID originalId = UUID.randomUUID();
         Delivery original = deliveryWithStatus(originalId, TENANT, DeliveryStatus.DEAD);
         deliveryQueryRepository.put(originalId, TENANT, original);
+        traceContextPort.current = Optional.of("00-replay-request-01");
 
         ReplayDeliveryResult result = useCase.replay(new ReplayDeliveryCommand(originalId, TENANT, "idem-1"));
 
@@ -48,6 +51,9 @@ class ReplayDeliveryUseCaseImplTest {
         Accepted accepted = (Accepted) result;
         assertThat(accepted.status()).isEqualTo(DeliveryStatus.PENDING);
         assertThat(accepted.newDeliveryId()).isNotEqualTo(originalId);
+        // The original DEAD row's own trace_context (empty for deliveryWithStatus's default) is
+        // carried through for the adapter's notification.replay span link (ADR-008 §2.5).
+        assertThat(accepted.originalTraceContext()).isEqualTo(original.traceContext());
 
         Delivery inserted = pipelineRepository.lastInsertReplayArg;
         assertThat(inserted.deliveryId()).isEqualTo(accepted.newDeliveryId());
@@ -59,6 +65,9 @@ class ReplayDeliveryUseCaseImplTest {
         assertThat(inserted.origin()).isEqualTo(DeliveryOrigin.REPLAY);
         assertThat(inserted.replayedFrom()).contains(originalId);
         assertThat(inserted.eventCreatedAt()).isEqualTo(original.eventCreatedAt());
+        // The replay row's own trace_context is the replay request's current traceparent, not
+        // Optional.empty() and not the original row's (ADR-008 §2.5) - a fresh business flow.
+        assertThat(inserted.traceContext()).contains("00-replay-request-01");
 
         // Only the one insert call was made - the original DEAD row was never written to.
         assertThat(pipelineRepository.callCount).isEqualTo(1);
@@ -107,7 +116,8 @@ class ReplayDeliveryUseCaseImplTest {
             FakeDeliveryQueryRepository queryRepository = new FakeDeliveryQueryRepository();
             queryRepository.put(id, TENANT, deliveryWithStatus(id, TENANT, status));
             FakePipelineRepository pipeline = new FakePipelineRepository();
-            ReplayDeliveryUseCaseImpl useCaseUnderTest = new ReplayDeliveryUseCaseImpl(queryRepository, pipeline);
+            ReplayDeliveryUseCaseImpl useCaseUnderTest =
+                    new ReplayDeliveryUseCaseImpl(queryRepository, pipeline, traceContextPort);
 
             ReplayDeliveryResult result = useCaseUnderTest.replay(new ReplayDeliveryCommand(id, TENANT, "idem"));
 
@@ -149,6 +159,15 @@ class ReplayDeliveryUseCaseImplTest {
         @Override
         public DeliveryPage findPage(TenantId tenant, DeliveryPageQuery query, int limit) {
             throw new UnsupportedOperationException("not used by this test");
+        }
+    }
+
+    private static class FakeTraceContextPort implements TraceContextPort {
+        Optional<String> current = Optional.empty();
+
+        @Override
+        public Optional<String> currentTraceparent() {
+            return current;
         }
     }
 

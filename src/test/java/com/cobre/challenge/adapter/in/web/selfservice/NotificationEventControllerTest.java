@@ -58,12 +58,15 @@ class NotificationEventControllerTest {
     private final ReplayIdempotencyGuard idempotencyGuard = new ReplayIdempotencyGuard(
             new IdempotencyProperties(Duration.ofMinutes(5), 10_000), Clock.fixed(NOW, ZoneOffset.UTC));
 
+    private final ReplaySpanRecorder replaySpanRecorder = mock(ReplaySpanRecorder.class);
+
     private final NotificationEventController controller = new NotificationEventController(
             queryUseCase,
             getUseCase,
             replayUseCase,
             idempotencyGuard,
-            new SelfServiceQueryProperties(50, 200, Duration.ofDays(30)));
+            new SelfServiceQueryProperties(50, 200, Duration.ofDays(30)),
+            replaySpanRecorder);
 
     @Test
     void listMapsTheResultToTheResponseBody() {
@@ -172,7 +175,7 @@ class NotificationEventControllerTest {
         UUID originalId = UUID.randomUUID();
         UUID newDeliveryId = UUID.randomUUID();
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
-                .thenReturn(new Accepted(newDeliveryId, DeliveryStatus.PENDING));
+                .thenReturn(new Accepted(newDeliveryId, DeliveryStatus.PENDING, Optional.empty()));
 
         ResponseEntity<Object> response = controller.replay(originalId, "idem-key-1", TENANT);
 

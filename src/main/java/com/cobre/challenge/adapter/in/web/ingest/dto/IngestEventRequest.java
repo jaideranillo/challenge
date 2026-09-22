@@ -1,6 +1,7 @@
 package com.cobre.challenge.adapter.in.web.ingest.dto;
 
 import com.cobre.challenge.application.port.in.pipeline.dto.RegisterNotificationEventCommand;
+import com.cobre.challenge.domain.policy.Redaction;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -27,5 +28,12 @@ public record IngestEventRequest(
 
     public RegisterNotificationEventCommand toCommand() {
         return new RegisterNotificationEventCommand(eventId, clientId, eventType, content, occurredAt);
+    }
+
+    /** ADR-008 §3.3: never print {@code content} — a redaction marker and its length instead. */
+    @Override
+    public String toString() {
+        return "IngestEventRequest[eventId=%s, clientId=%s, eventType=%s, content=%s, occurredAt=%s]"
+                .formatted(eventId, clientId, eventType, Redaction.redact(content), occurredAt);
     }
 }

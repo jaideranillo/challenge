@@ -89,7 +89,7 @@ class RelayHalfOpenProbeAcceptanceTest {
         DispatchPendingDeliveriesResult result =
                 dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(50, asOf));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 1));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 1, List.of()));
 
         // Exactly one row QUEUED, the other two untouched PENDING with their original next_attempt_at.
         long queuedCount = deliveryIds.stream()
@@ -127,7 +127,7 @@ class RelayHalfOpenProbeAcceptanceTest {
         DispatchPendingDeliveriesResult secondCycle =
                 dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(50, asOf2));
 
-        assertThat(secondCycle).isEqualTo(new DispatchPendingDeliveriesResult(0, 0));
+        assertThat(secondCycle).isEqualTo(new DispatchPendingDeliveriesResult(0, 0, List.of()));
         assertThat(statusOf(claimedDeliveryId)).isEqualTo("QUEUED");
         for (UUID id : deliveryIds) {
             if (!id.equals(claimedDeliveryId)) {
@@ -153,7 +153,7 @@ class RelayHalfOpenProbeAcceptanceTest {
         DispatchPendingDeliveriesResult result =
                 dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(50, asOf));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(0, 0));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(0, 0, List.of()));
         assertThat(receiveMessages()).isEmpty();
         assertThat(readSubscriptionRow(subscriptionId).get("circuit_state")).isEqualTo("OPEN");
     }
@@ -183,7 +183,7 @@ class RelayHalfOpenProbeAcceptanceTest {
                 dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(50, asOf));
 
         // 1 probe from the OPEN subscription + the CLOSED subscription's max_concurrency of 2.
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(3, 3));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(3, 3, List.of()));
 
         long closedQueuedCount = closedDeliveryIds.stream()
                 .filter(id -> "QUEUED".equals(statusOf(id)))

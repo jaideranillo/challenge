@@ -81,6 +81,24 @@ requires the resource to start exactly at `-----BEGIN PUBLIC KEY-----` — text 
 `IllegalArgumentException: Key is not in PEM-encoded X.509 format`. Keep such warnings in an
 adjacent README instead of inside the `.pem` file itself.
 
+## `RestClient.Builder` is not always an injectable bean even with `spring-boot-starter-webmvc` present
+
+Injecting `RestClient.Builder` as a constructor parameter (the documented pattern for getting a
+pre-configured builder) failed with `UnsatisfiedDependencyException: No qualifying bean of type
+'org.springframework.web.client.RestClient$Builder' available` in this project's dependency set
+(no `RestClientAutoConfiguration` bean was present to satisfy it). **Fix**: construct it directly
+— `RestClient.builder().baseUrl(...).build()` in the constructor body — instead of relying on DI
+for it, when there's no other reason to need the shared/customized builder bean.
+
+## Two `SecurityFilterChain` beans with overlapping matchers: the lower `@Order` value always wins, regardless of matcher specificity
+
+`SecurityConfig`'s production chain (`@Order(2)`, matcher `/internal/**`, `anyRequest().authenticated()`)
+and a new narrower local-only chain (matcher `/internal/events/**`, intended to permit-all under one
+path) do **not** resolve by "most specific matcher wins" — `FilterChainProxy` tries chains in `@Order`
+sequence and uses the first whose matcher matches. To make the narrower chain win, it needs a lower
+`@Order` value than the broader one it's meant to override (used `@Order(0)`, ahead of the broad
+chain's `@Order(2)`), not just a narrower path pattern.
+
 ## Local dev Postgres volume can drift: schema has a column Flyway's own history table doesn't know about
 
 Symptom: `ERROR: column "x" of relation "y" already exists` on a migration that should be a no-op

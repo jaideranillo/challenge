@@ -37,7 +37,7 @@ class DispatchPendingDeliveriesUseCaseImplTest {
     void emptyClaim_returnsZeroZero_andMakesNoPublishCall() {
         DispatchPendingDeliveriesResult result = useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(0, 0));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(0, 0, List.of()));
         assertThat(queuePort.publishBatchCalls).isZero();
     }
 
@@ -49,7 +49,7 @@ class DispatchPendingDeliveriesUseCaseImplTest {
 
         DispatchPendingDeliveriesResult result = useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 1));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 1, List.of()));
         assertThat(queuePort.lastPointers).hasSize(1);
         DeliveryPointer pointer = queuePort.lastPointers.get(0);
         assertThat(pointer.deliveryId()).isEqualTo(delivery.deliveryId());
@@ -58,27 +58,29 @@ class DispatchPendingDeliveriesUseCaseImplTest {
     }
 
     @Test
-    void traceparent_prefersCurrentSpan_overPersistedTraceContext() {
+    void traceparent_prefersPersistedTraceContext_overTheSchedulersCurrentSpan() {
         Delivery delivery = pendingDelivery();
         pipelinePort.claimed = List.of(delivery);
-        traceContextPort.current = Optional.of("00-current-01");
+        traceContextPort.current = Optional.of("00-scheduler-current-01");
         queuePort.result = new PublishBatchResult(1, List.of());
 
         useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(queuePort.lastPointers.get(0).traceparent()).contains("00-current-01");
+        // The row's own trace_context ("00-persisted-01" per pendingDelivery()) wins: the relay's
+        // own scheduling context must never overwrite a delivery's ingest trace (ADR-008 §2.3).
+        assertThat(queuePort.lastPointers.get(0).traceparent()).isEqualTo(delivery.traceContext());
     }
 
     @Test
-    void traceparent_fallsBackToPersistedTraceContext_whenNoSpanActive() {
-        Delivery delivery = pendingDelivery();
+    void traceparent_fallsBackToTheSchedulersCurrentSpan_onlyWhenTheRowHasNoPersistedTraceContext() {
+        Delivery delivery = pendingDeliveryWithNoTraceContext();
         pipelinePort.claimed = List.of(delivery);
-        traceContextPort.current = Optional.empty();
+        traceContextPort.current = Optional.of("00-scheduler-current-01");
         queuePort.result = new PublishBatchResult(1, List.of());
 
         useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(queuePort.lastPointers.get(0).traceparent()).isEqualTo(delivery.traceContext());
+        assertThat(queuePort.lastPointers.get(0).traceparent()).contains("00-scheduler-current-01");
     }
 
     @Test
@@ -89,7 +91,7 @@ class DispatchPendingDeliveriesUseCaseImplTest {
 
         DispatchPendingDeliveriesResult result = useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 0));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 0, List.of()));
         assertThat(pipelinePort.writeCalls).isZero();
     }
 
@@ -101,7 +103,7 @@ class DispatchPendingDeliveriesUseCaseImplTest {
 
         DispatchPendingDeliveriesResult result = useCase.dispatch(new DispatchPendingDeliveriesCommand(10, AS_OF));
 
-        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 0));
+        assertThat(result).isEqualTo(new DispatchPendingDeliveriesResult(1, 0, List.of()));
     }
 
     @Test
@@ -114,6 +116,10 @@ class DispatchPendingDeliveriesUseCaseImplTest {
     }
 
     private static Delivery pendingDelivery() {
+        return pendingDeliveryWithTraceContext("00-persisted-01");
+    }
+
+    private static Delivery pendingDeliveryWithNoTraceContext() {
         return new Delivery(
                 UUID.randomUUID(),
                 "evt-1",
@@ -127,7 +133,24 @@ class DispatchPendingDeliveriesUseCaseImplTest {
                 Optional.empty(),
                 Optional.empty(),
                 AS_OF,
-                Optional.of("00-persisted-01"));
+                Optional.empty());
+    }
+
+    private static Delivery pendingDeliveryWithTraceContext(String traceContext) {
+        return new Delivery(
+                UUID.randomUUID(),
+                "evt-1",
+                UUID.randomUUID(),
+                "client-1",
+                DeliveryStatus.QUEUED,
+                DeliveryOrigin.INGEST,
+                Optional.empty(),
+                0,
+                Optional.of(AS_OF.plusSeconds(300)),
+                Optional.empty(),
+                Optional.empty(),
+                AS_OF,
+                Optional.of(traceContext));
     }
 
     private static class FakePipelinePort implements DeliveryPipelineRepositoryPort {

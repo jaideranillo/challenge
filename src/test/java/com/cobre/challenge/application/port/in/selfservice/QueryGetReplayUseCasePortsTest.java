@@ -94,7 +94,7 @@ class QueryGetReplayUseCasePortsTest {
     @Test
     void replayResultAcceptedCarriesNewDeliveryIdAndPendingStatus() {
         UUID newId = UUID.randomUUID();
-        ReplayDeliveryResult result = new Accepted(newId, DeliveryStatus.PENDING);
+        ReplayDeliveryResult result = new Accepted(newId, DeliveryStatus.PENDING, Optional.empty());
 
         assertThat(result).isInstanceOf(Accepted.class);
         assertThat(((Accepted) result).newDeliveryId()).isEqualTo(newId);
