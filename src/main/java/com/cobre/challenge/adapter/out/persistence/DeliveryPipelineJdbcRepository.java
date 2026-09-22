@@ -491,7 +491,7 @@ public class DeliveryPipelineJdbcRepository implements DeliveryPipelineRepositor
                         + "    FROM deliveries d"
                         + "    WHERE d.subscription_id = s.subscription_id"
                         + "      AND d.status IN ('PENDING', 'RETRYING', 'QUEUED', 'PROCESSING')"
-                        + "      AND d.next_attempt_at <= :as_of"
+                        + "      AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= :as_of)"
                         + "      AND (d.status <> 'PENDING'    OR d.created_at < :as_of - interval '30 seconds')"
                         + "      AND (d.status <> 'PROCESSING' OR d.updated_at < :as_of - interval '60 seconds')"
                         + "    ORDER BY d.next_attempt_at, d.delivery_id"

@@ -88,6 +88,21 @@ class ClaimDuePredicateTest {
         assertThat(result.stream().map(Delivery::deliveryId)).contains(included);
     }
 
+    /**
+     * Regression: next_attempt_at IS NULL means "due now" (V2__deliveries.sql column comment)
+     * and must be claimed like any other due row. {@code NULL <= :as_of} evaluates to NULL in
+     * SQL, so a WHERE clause without an explicit IS NULL branch silently excludes it forever.
+     */
+    @Test
+    void nextAttemptAt_null_isDueNow_claimed() {
+        UUID included = seedDeliveryWithCreatedAt(subscriptionId, "PENDING",
+                null, asOf.minus(5, ChronoUnit.MINUTES));
+
+        List<Delivery> result = claimDue(10);
+
+        assertClaimed(result, included);
+    }
+
     /** Test 9: PENDING younger than 30-second grace excluded; older included. */
     @Test
     void pending_graceWindow_30s() {
