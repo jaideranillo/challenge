@@ -3,6 +3,7 @@ package com.cobre.challenge.application.usecase;
 import com.cobre.challenge.application.port.in.pipeline.DispatchPendingDeliveriesUseCase;
 import com.cobre.challenge.application.port.in.pipeline.dto.DispatchPendingDeliveriesCommand;
 import com.cobre.challenge.application.port.in.pipeline.dto.DispatchPendingDeliveriesResult;
+import com.cobre.challenge.application.port.in.pipeline.dto.DispatchedDeliveryEntry;
 import com.cobre.challenge.application.port.out.queue.NotificationQueuePort;
 import com.cobre.challenge.application.port.out.queue.dto.DeliveryPointer;
 import com.cobre.challenge.application.port.out.queue.dto.PublishBatchResult;
@@ -11,9 +12,12 @@ import com.cobre.challenge.application.usecase.dto.RelayBatchClaimResult;
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +36,8 @@ public class DispatchPendingDeliveriesUseCaseImpl implements DispatchPendingDeli
     private final Counter publishedCounter;
     private final Counter publishFailedCounter;
     private final Counter circuitPromotedCounter;
+    private final Timer dispatchLatencyTimer;
+    private final MeterRegistry meterRegistry;
 
     public DispatchPendingDeliveriesUseCaseImpl(
             RelayBatchClaimer relayBatchClaimer,
@@ -41,16 +47,28 @@ public class DispatchPendingDeliveriesUseCaseImpl implements DispatchPendingDeli
         this.relayBatchClaimer = relayBatchClaimer;
         this.queuePort = queuePort;
         this.traceContextPort = traceContextPort;
+        this.meterRegistry = meterRegistry;
         // No client_id/subscription_id tag on any of these (ADR-002 Q8, SS3.1).
         this.claimedCounter = meterRegistry.counter("notification.relay.claimed");
         this.publishedCounter = meterRegistry.counter("notification.relay.published");
         this.publishFailedCounter = meterRegistry.counter("notification.relay.publish.failed");
         this.circuitPromotedCounter =
                 meterRegistry.counter("notification.circuit.transition", "direction", "OPEN_TO_HALF_OPEN");
+        // Untagged (ADR-008 §4.1/§4.3): one poll cycle, claim query through the last publish returning.
+        this.dispatchLatencyTimer = meterRegistry.timer("notification.relay.dispatch.latency");
     }
 
     @Override
     public DispatchPendingDeliveriesResult dispatch(DispatchPendingDeliveriesCommand command) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        try {
+            return doDispatch(command);
+        } finally {
+            sample.stop(dispatchLatencyTimer);
+        }
+    }
+
+    private DispatchPendingDeliveriesResult doDispatch(DispatchPendingDeliveriesCommand command) {
         // Transaction boundary is RelayBatchClaimer's alone; it commits before this method returns from the call.
         RelayBatchClaimResult claim = relayBatchClaimer.claimAndPromote(command.batchLimit(), command.asOf());
         List<Delivery> claimed = claim.claimed();
@@ -61,7 +79,7 @@ public class DispatchPendingDeliveriesUseCaseImpl implements DispatchPendingDeli
         }
 
         if (claimed.isEmpty()) {
-            return new DispatchPendingDeliveriesResult(0, 0);
+            return new DispatchPendingDeliveriesResult(0, 0, List.of());
         }
 
         Optional<String> currentTraceparent = traceContextPort.currentTraceparent();
@@ -69,16 +87,24 @@ public class DispatchPendingDeliveriesUseCaseImpl implements DispatchPendingDeli
         for (Delivery delivery : claimed) {
             pointers.add(new DeliveryPointer(
                     delivery.deliveryId(), delivery.subscriptionId(), delivery.attemptCount(),
-                    currentTraceparent.or(delivery::traceContext)));
+                    delivery.traceContext().or(() -> currentTraceparent)));
         }
 
-        int publishedCount = publishBatch(pointers, claimed.size());
-        log.info("Relay cycle claimed_count={} published_count={}", claimed.size(), publishedCount);
-        return new DispatchPendingDeliveriesResult(claimed.size(), publishedCount);
+        PublishOutcome outcome = publishBatch(pointers, claimed.size());
+        List<DispatchedDeliveryEntry> entries = new ArrayList<>(pointers.size());
+        for (DeliveryPointer pointer : pointers) {
+            entries.add(new DispatchedDeliveryEntry(
+                    pointer.deliveryId(),
+                    pointer.traceparent(),
+                    !outcome.failedDeliveryIds().contains(pointer.deliveryId())));
+        }
+
+        log.info("Relay cycle claimed_count={} published_count={}", claimed.size(), outcome.publishedCount());
+        return new DispatchPendingDeliveriesResult(claimed.size(), outcome.publishedCount(), entries);
     }
 
     // Failed/thrown publishes trigger no database write: the pushed next_attempt_at is the recovery mechanism (ADR-002 SS2.1).
-    private int publishBatch(List<DeliveryPointer> pointers, int claimedCount) {
+    private PublishOutcome publishBatch(List<DeliveryPointer> pointers, int claimedCount) {
         try {
             PublishBatchResult result = queuePort.publishBatch(pointers);
             List<UUID> failedDeliveryIds = result.failedDeliveryIds();
@@ -91,11 +117,18 @@ public class DispatchPendingDeliveriesUseCaseImpl implements DispatchPendingDeli
             if (result.publishedCount() > 0) {
                 publishedCounter.increment(result.publishedCount());
             }
-            return result.publishedCount();
+            return new PublishOutcome(result.publishedCount(), Set.copyOf(failedDeliveryIds));
         } catch (Throwable t) {
             publishFailedCounter.increment(claimedCount);
             log.warn("publishBatch threw for claimed_count={}", claimedCount, t);
-            return 0;
+            Set<UUID> allFailed = new HashSet<>(pointers.size());
+            for (DeliveryPointer pointer : pointers) {
+                allFailed.add(pointer.deliveryId());
+            }
+            return new PublishOutcome(0, allFailed);
         }
+    }
+
+    private record PublishOutcome(int publishedCount, Set<UUID> failedDeliveryIds) {
     }
 }

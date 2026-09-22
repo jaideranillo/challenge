@@ -56,11 +56,10 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
 
     private static final Logger log = LoggerFactory.getLogger(AttemptDeliveryUseCaseImpl.class);
 
-    private static final String MDC_DELIVERY_ID = "delivery_id";
-    private static final String MDC_SUBSCRIPTION_ID = "subscription_id";
     private static final String MDC_ATTEMPT_NUMBER = "attempt_number";
     private static final String MDC_STATUS_CLASS = "status_class";
-    private static final String MDC_TRACE_ID = "trace_id";
+    private static final String MDC_EVENT_ID = "event_id";
+    private static final String MDC_CLIENT_ID = "client_id";
 
     private static final String HEADER_TIMESTAMP = "X-Cobre-Timestamp";
     private static final String HEADER_DELIVERY_ID = "X-Cobre-Delivery-Id";
@@ -73,13 +72,6 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
      * short-circuit"). No HTTP attempt was made, so {@code outcome} is empty.
      */
     private static final AttemptDeliveryResult CLAIM_LOST = AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED);
-
-    /**
-     * Shared result for a deferral (bulkhead rejection in step 3, or an OPEN circuit in step 4).
-     * The status is genuinely QUEUED ({@code deferDelivery} never changes status), and no HTTP
-     * attempt was made, so {@code outcome} is empty.
-     */
-    private static final AttemptDeliveryResult DEFERRED = AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED);
 
     private final DeliveryPipelineRepositoryPort pipelinePort;
     private final SubscriptionRepositoryPort subscriptionPort;
@@ -127,15 +119,15 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
         this.randomGenerator = randomGenerator;
     }
 
+    /**
+     * {@code delivery_id}/{@code subscription_id} are already in MDC by the time this is called —
+     * {@link com.cobre.challenge.adapter.in.messaging.DeliveryQueueListener} sets them at the
+     * boundary. This method adds {@code event_id}/{@code client_id} once the row is loaded and
+     * never clears MDC: it does not own the scope it is running inside (ADR-008 §3.2).
+     */
     @Override
     public AttemptDeliveryResult attempt(AttemptDeliveryCommand command) {
-        MDC.put(MDC_DELIVERY_ID, command.deliveryId().toString());
-        MDC.put(MDC_SUBSCRIPTION_ID, command.subscriptionId().toString());
-        try {
-            return doAttempt(command);
-        } finally {
-            MDC.clear();
-        }
+        return doAttempt(command);
     }
 
     private AttemptDeliveryResult doAttempt(AttemptDeliveryCommand command) {
@@ -157,18 +149,23 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
             return CLAIM_LOST;
         }
         Delivery delivery = deliveryOpt.get();
+        // event_id/client_id: set once the claimed row is loaded (ADR-008 §3.2/§5); this use case
+        // never clears MDC, so these keys ride out inside the listener's scope.
+        MDC.put(MDC_EVENT_ID, delivery.eventId());
+        MDC.put(MDC_CLIENT_ID, delivery.clientId());
+        int attemptNumber = delivery.attemptCount() + 1;
 
         Optional<Subscription> subscriptionOpt = subscriptionPort.findById(subscriptionId);
         if (subscriptionOpt.isEmpty()) {
             log.warn("Subscription not found for a claimed delivery");
-            return CLAIM_LOST;
+            return AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED, delivery.eventId(), delivery.clientId(), attemptNumber);
         }
         Subscription subscription = subscriptionOpt.get();
 
         Optional<NotificationEvent> eventOpt = eventPort.findById(delivery.eventId());
         if (eventOpt.isEmpty()) {
             log.warn("Notification event not found for a claimed delivery");
-            return CLAIM_LOST;
+            return AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED, delivery.eventId(), delivery.clientId(), attemptNumber);
         }
         NotificationEvent event = eventOpt.get();
 
@@ -176,22 +173,20 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
             circuitBreakerPort.resetIfOpenLocally(subscriptionId);
         }
 
-        int attemptNumber = delivery.attemptCount() + 1;
         MDC.put(MDC_ATTEMPT_NUMBER, String.valueOf(attemptNumber));
-        command.traceparent().or(delivery::traceContext).ifPresent(traceId -> MDC.put(MDC_TRACE_ID, traceId));
 
         // Step 3: bulkhead permit.
         WorkerProperties.Bulkhead bulkheadConfig = workerProperties.bulkhead();
         if (!bulkheadPort.tryAcquire(subscriptionId, subscription.maxConcurrency(), bulkheadConfig.acquireTimeout())) {
             deferWithJitter(deliveryId, now, bulkheadConfig, "notification.delivery.bulkhead.deferred");
-            return DEFERRED;
+            return AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED, delivery.eventId(), delivery.clientId(), attemptNumber);
         }
 
         try {
             // Step 4: circuit gate. OPEN defers exactly as step 3; HALF_OPEN proceeds as the probe.
             if (subscription.circuitState() == CircuitState.OPEN) {
                 deferWithJitter(deliveryId, now, bulkheadConfig, "notification.delivery.circuit.deferred");
-                return DEFERRED;
+                return AttemptDeliveryResult.noAttempt(DeliveryStatus.QUEUED, delivery.eventId(), delivery.clientId(), attemptNumber);
             }
             boolean isProbe = subscription.circuitState() == CircuitState.HALF_OPEN;
 
@@ -233,11 +228,12 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
                 attemptNumber, event.content());
         String body = serializerPort.serialize(envelope);
         String timestamp = now.toString();
+        int contentLength = event.content().length();
 
         Optional<String> secret = secretPort.resolve(subscription.secretRef());
         if (secret.isEmpty()) {
             log.warn("Secret unresolved; failing closed, no request sent");
-            return recordAndReturn(new AttemptOutcomeCommand(
+            return recordAndReturn(delivery, attemptNumber, contentLength, 0, new AttemptOutcomeCommand(
                     delivery.deliveryId(), subscription.subscriptionId(), attemptNumber, now,
                     AttemptOutcome.NON_RETRYABLE, OptionalInt.empty(), TransportFailure.NONE, Optional.empty(), 0,
                     Optional.of("secret unresolved"), Optional.empty(), isProbe, delivery.attemptCount()));
@@ -257,7 +253,8 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
         int validationTimeMs = (int) Duration.between(validationStart, Instant.now(clock)).toMillis();
 
         if (verdict.state() != EgressVerdict.State.ALLOWED) {
-            return handleEgressRejection(delivery, subscription, attemptNumber, isProbe, now, verdict, validationTimeMs);
+            return handleEgressRejection(
+                    delivery, subscription, attemptNumber, isProbe, now, verdict, validationTimeMs, contentLength);
         }
 
         WebhookResponse response = webhookClientPort.send(new WebhookRequest(subscription.targetUrl(), body, headers));
@@ -270,7 +267,7 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
                 ? OptionalInt.of(response.statusCode())
                 : OptionalInt.empty();
 
-        return recordAndReturn(new AttemptOutcomeCommand(
+        return recordAndReturn(delivery, attemptNumber, contentLength, response.responseBodyLength(), new AttemptOutcomeCommand(
                 delivery.deliveryId(), subscription.subscriptionId(), attemptNumber, now, outcome, httpStatus,
                 response.failure(), Optional.empty(), response.responseTimeMs(), response.responseExcerpt(),
                 response.retryAfter(), isProbe, delivery.attemptCount()));
@@ -288,7 +285,8 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
             boolean isProbe,
             Instant now,
             EgressVerdict verdict,
-            int elapsedMs) {
+            int elapsedMs,
+            int contentLength) {
         AttemptOutcome outcome = verdict.state() == EgressVerdict.State.DNS_FAILURE
                 ? AttemptOutcome.RETRYABLE
                 : AttemptOutcome.NON_RETRYABLE;
@@ -306,7 +304,7 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
             }
         }
 
-        return recordAndReturn(new AttemptOutcomeCommand(
+        return recordAndReturn(delivery, attemptNumber, contentLength, 0, new AttemptOutcomeCommand(
                 delivery.deliveryId(), subscription.subscriptionId(), attemptNumber, now, outcome,
                 OptionalInt.empty(), TransportFailure.NONE, Optional.of(verdict.reason()), elapsedMs, Optional.empty(),
                 Optional.empty(), isProbe, delivery.attemptCount()));
@@ -353,13 +351,23 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
         return Optional.empty();
     }
 
-    private AttemptDeliveryResult recordAndReturn(AttemptOutcomeCommand outcomeCommand) {
+    private AttemptDeliveryResult recordAndReturn(
+            Delivery delivery, int attemptNumber, int contentLength, int responseBodyLength,
+            AttemptOutcomeCommand outcomeCommand) {
         outcomeWriter.write(outcomeCommand);
         AttemptOutcome outcome = outcomeCommand.outcome();
         MDC.put(MDC_STATUS_CLASS, outcome.name());
         meterRegistry.counter("notification.delivery.attempt", "outcome", outcome.name()).increment();
-        log.info("Attempt outcome={}", outcome);
-        return AttemptDeliveryResult.of(nominalStatusFor(outcome), outcome);
+        // ADR-008 §3.3: content/response_excerpt are never logged; their lengths stand in.
+        log.info(
+                "Attempt outcome={} http_status={} content_length={} response_body_length={}",
+                outcome,
+                outcomeCommand.httpStatus().isPresent() ? outcomeCommand.httpStatus().getAsInt() : -1,
+                contentLength,
+                responseBodyLength);
+        return AttemptDeliveryResult.of(
+                nominalStatusFor(outcome), outcome, delivery.eventId(), delivery.clientId(), attemptNumber,
+                outcomeCommand.httpStatus());
     }
 
     /**

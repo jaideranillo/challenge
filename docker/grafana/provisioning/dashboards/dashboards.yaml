@@ -1,0 +1,14 @@
+apiVersion: 1
+
+# TASK-009-07: additional file-based dashboard provider for the FEAT-009 dashboard.
+# Mounted alongside the otel-lgtm image's own bundled provider files at the
+# container-side path verified against the running grafana/otel-lgtm image:
+#   /otel-lgtm/grafana/conf/provisioning/dashboards/
+# The image's own RED Metrics / JVM Metrics providers in that same directory are
+# untouched by this file.
+providers:
+  - name: "Notification Delivery"
+    type: file
+    options:
+      path: /otel-lgtm/custom-dashboards
+      foldersFromFilesStructure: false

@@ -217,7 +217,7 @@ class AttemptDeliveryUseCaseImplTest {
     void allowedVerdict_proceedsToThePost_unchanged() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         AttemptDeliveryResult result = useCase.attempt(command());
 
@@ -231,7 +231,7 @@ class AttemptDeliveryUseCaseImplTest {
     void theValidatorIsConsultedOnEveryAttempt_noCachedVerdict() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
         useCase.attempt(command());
@@ -313,7 +313,7 @@ class AttemptDeliveryUseCaseImplTest {
                 .thenReturn(Optional.of(subscriptionWithCircuitState(CircuitState.HALF_OPEN)));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -332,7 +332,7 @@ class AttemptDeliveryUseCaseImplTest {
                 meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), RandomGenerator.getDefault());
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         for (int i = 0; i < 12; i++) {
             scenarioUseCase.attempt(command());
@@ -347,7 +347,7 @@ class AttemptDeliveryUseCaseImplTest {
                 .thenReturn(Optional.of(subscriptionWithCircuitState(CircuitState.HALF_OPEN)));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -368,7 +368,7 @@ class AttemptDeliveryUseCaseImplTest {
                 .thenReturn(Optional.of(subscriptionWithCircuitState(CircuitState.HALF_OPEN)));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -383,7 +383,7 @@ class AttemptDeliveryUseCaseImplTest {
     void scenario8_throttledResponseNeverReachesTheBreaker() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(429, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(429, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -400,7 +400,7 @@ class AttemptDeliveryUseCaseImplTest {
         when(circuitBreakerPort.recordFailure(SUBSCRIPTION_ID)).thenReturn(false);
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -434,7 +434,7 @@ class AttemptDeliveryUseCaseImplTest {
         when(secretPort.resolve(PREVIOUS_SECRET_REF)).thenReturn(Optional.of("previous-secret-material"));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -450,7 +450,7 @@ class AttemptDeliveryUseCaseImplTest {
                 .thenReturn(Optional.of(subscriptionWithPreviousSecret(NOW.minusSeconds(60))));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -465,7 +465,7 @@ class AttemptDeliveryUseCaseImplTest {
     void scenario12_permitReleasedExactlyOnceOnSuccess() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -476,7 +476,7 @@ class AttemptDeliveryUseCaseImplTest {
     void scenario12_permitReleasedExactlyOnceOnFailure() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 
@@ -498,7 +498,7 @@ class AttemptDeliveryUseCaseImplTest {
         when(pipelinePort.findById(DELIVERY_ID)).thenReturn(Optional.of(deliveryWithAttemptCount(4)));
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(new AttemptDeliveryCommand(DELIVERY_ID, SUBSCRIPTION_ID, 99, Optional.empty()));
 
@@ -511,7 +511,7 @@ class AttemptDeliveryUseCaseImplTest {
     void scenario16_oneInstantIsUsedForTheClaimTheHeaderAndTheWritersCommand() {
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
-                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), Optional.empty()));
+                .thenReturn(new WebhookResponse(200, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
 
         useCase.attempt(command());
 

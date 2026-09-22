@@ -111,7 +111,7 @@ class RelayPartialBatchFailureAcceptanceTest {
         // Cycle 1 at asOf: two of five entries are refused by SQS.
         DispatchPendingDeliveriesResult cycle1 = dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(10, asOf));
 
-        assertThat(cycle1).isEqualTo(new DispatchPendingDeliveriesResult(5, 3));
+        assertThat(cycle1).isEqualTo(new DispatchPendingDeliveriesResult(5, 3, List.of()));
 
         // Heart of the scenario: every row, published and refused alike, is QUEUED with the
         // pushed clock - no status difference, no compensation.
@@ -130,7 +130,7 @@ class RelayPartialBatchFailureAcceptanceTest {
         DispatchPendingDeliveriesResult control =
                 dispatchUseCase.dispatch(new DispatchPendingDeliveriesCommand(10, asOf.plus(Duration.ofMinutes(1))));
 
-        assertThat(control).isEqualTo(new DispatchPendingDeliveriesResult(0, 0));
+        assertThat(control).isEqualTo(new DispatchPendingDeliveriesResult(0, 0, List.of()));
 
         // Repair the refused rows so they can publish, then let the pushed clock elapse.
         for (UUID deliveryId : refusedIds) {

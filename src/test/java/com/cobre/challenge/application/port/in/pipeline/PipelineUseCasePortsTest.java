@@ -46,7 +46,7 @@ class PipelineUseCasePortsTest {
 
     @Test
     void dispatchPendingDeliveriesResultCompiles() {
-        DispatchPendingDeliveriesResult result = new DispatchPendingDeliveriesResult(3, 3);
+        DispatchPendingDeliveriesResult result = new DispatchPendingDeliveriesResult(3, 3, List.of());
         assertThat(result.claimedCount()).isEqualTo(3);
     }
 

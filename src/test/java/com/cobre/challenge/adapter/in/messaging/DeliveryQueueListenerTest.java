@@ -17,6 +17,8 @@ import com.cobre.challenge.application.port.in.pipeline.dto.AttemptDeliveryComma
 import com.cobre.challenge.application.port.in.pipeline.dto.AttemptDeliveryResult;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
 import com.cobre.challenge.domain.policy.AttemptOutcome;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
@@ -58,8 +60,8 @@ class DeliveryQueueListenerTest {
             Duration.ofHours(1),
             1024);
 
-    private final DeliveryQueueListener listener =
-            new DeliveryQueueListener(sqsClient, useCase, workerProperties, objectMapper, fanOutExecutor, QUEUE_URL);
+    private final DeliveryQueueListener listener = new DeliveryQueueListener(
+            sqsClient, useCase, workerProperties, objectMapper, Tracer.NOOP, Propagator.NOOP, fanOutExecutor, QUEUE_URL);
 
     private void stubReceive(Message... messages) {
         when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))

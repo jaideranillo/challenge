@@ -69,8 +69,19 @@ public final class PointerMessage {
         private final Optional<UUID> deliveryId;
 
         UnparsablePointerMessageException(Optional<UUID> deliveryId, Throwable cause) {
-            super("Unparsable pointer message" + deliveryId.map(id -> " delivery_id=" + id).orElse(" (no delivery_id)"), cause);
+            super(buildMessage(deliveryId, cause), null);
             this.deliveryId = deliveryId;
+        }
+
+        /** ADR-008 §3.4: folds the cause's class name and message length in, never its message text. */
+        private static String buildMessage(Optional<UUID> deliveryId, Throwable cause) {
+            String base = "Unparsable pointer message"
+                    + deliveryId.map(id -> " delivery_id=" + id).orElse(" (no delivery_id)");
+            if (cause == null) {
+                return base;
+            }
+            int causeMessageLength = cause.getMessage() != null ? cause.getMessage().length() : 0;
+            return base + " cause_class=" + cause.getClass().getName() + " cause_message_length=" + causeMessageLength;
         }
 
         public Optional<UUID> deliveryId() {

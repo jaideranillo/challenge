@@ -15,6 +15,8 @@ import com.cobre.challenge.adapter.in.messaging.config.WorkerProperties;
 import com.cobre.challenge.adapter.out.messaging.config.SqsProperties;
 import com.cobre.challenge.application.port.out.persistence.DeliveryPipelineRepositoryPort;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -67,7 +69,15 @@ class DeliveryDlqConsumerTest {
         SqsProperties sqsProperties =
                 new SqsProperties(Optional.empty(), "us-east-1", null, new SqsProperties.Queues("deliveries", "deliveries-dlq"));
         this.consumer = new DeliveryDlqConsumer(
-                sqsClient, objectMapper, sqsProperties, pipelinePort, clock, workerProperties, new SimpleMeterRegistry());
+                sqsClient,
+                objectMapper,
+                sqsProperties,
+                pipelinePort,
+                clock,
+                workerProperties,
+                new SimpleMeterRegistry(),
+                Tracer.NOOP,
+                Propagator.NOOP);
     }
 
     private void stubReceive(Message... messages) {

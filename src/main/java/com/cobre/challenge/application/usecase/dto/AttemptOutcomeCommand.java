@@ -1,6 +1,7 @@
 package com.cobre.challenge.application.usecase.dto;
 
 import com.cobre.challenge.domain.policy.AttemptOutcome;
+import com.cobre.challenge.domain.policy.Redaction;
 import com.cobre.challenge.domain.policy.TransportFailure;
 import java.time.Duration;
 import java.time.Instant;
@@ -51,5 +52,15 @@ public record AttemptOutcomeCommand(
         if (currentAttemptCount < 0) {
             throw new IllegalArgumentException("currentAttemptCount must be >= 0, was " + currentAttemptCount);
         }
+    }
+
+    /** ADR-008 §3.3: never print {@code responseExcerpt} — a redaction marker and its length instead. */
+    @Override
+    public String toString() {
+        return "AttemptOutcomeCommand[deliveryId=%s, subscriptionId=%s, attemptNumber=%d, attemptedAt=%s, outcome=%s, httpStatus=%s, transportFailure=%s, error=%s, responseTimeMs=%d, responseExcerpt=%s, retryAfter=%s, wasHalfOpenProbe=%s, currentAttemptCount=%d]"
+                .formatted(
+                        deliveryId, subscriptionId, attemptNumber, attemptedAt, outcome, httpStatus,
+                        transportFailure, error, responseTimeMs, Redaction.redact(responseExcerpt), retryAfter,
+                        wasHalfOpenProbe, currentAttemptCount);
     }
 }

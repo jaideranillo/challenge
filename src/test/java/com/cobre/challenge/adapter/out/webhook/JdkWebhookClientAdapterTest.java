@@ -12,6 +12,7 @@ import com.cobre.challenge.adapter.out.webhook.config.WebhookHttpClientConfig;
 import com.cobre.challenge.application.port.out.webhook.dto.WebhookRequest;
 import com.cobre.challenge.application.port.out.webhook.dto.WebhookResponse;
 import com.cobre.challenge.domain.policy.TransportFailure;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
@@ -39,11 +40,13 @@ class JdkWebhookClientAdapterTest {
             Duration.ofHours(1),
             1024);
 
+    private static final SimpleMeterRegistry METER_REGISTRY = new SimpleMeterRegistry();
+
     @Test
     void a200ResponseProducesNoneAndATruncatedExcerpt() throws Exception {
         HttpClient httpClient = mock(HttpClient.class);
         doReturn(fakeResponse(200, "0123456789", Map.of())).when(httpClient).send(any(), any());
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, withExcerptLimit(4));
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, withExcerptLimit(4), METER_REGISTRY);
 
         WebhookResponse response = adapter.send(webhookRequest("https://example.com/hook"));
 
@@ -56,7 +59,7 @@ class JdkWebhookClientAdapterTest {
     void a500ResponseIsPassedThroughUnchanged() throws Exception {
         HttpClient httpClient = mock(HttpClient.class);
         doReturn(fakeResponse(500, "server error", Map.of())).when(httpClient).send(any(), any());
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES);
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES, METER_REGISTRY);
 
         WebhookResponse response = adapter.send(webhookRequest("https://example.com/hook"));
 
@@ -68,7 +71,7 @@ class JdkWebhookClientAdapterTest {
     void aThrownHttpTimeoutExceptionProducesTimeoutAndDoesNotPropagate() throws Exception {
         HttpClient httpClient = mock(HttpClient.class);
         doThrow(new HttpTimeoutException("timed out")).when(httpClient).send(any(), any());
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES);
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES, METER_REGISTRY);
 
         WebhookResponse response = adapter.send(webhookRequest("https://example.com/hook"));
 
@@ -82,7 +85,7 @@ class JdkWebhookClientAdapterTest {
     void theRequestBuiltCarriesEveryHeaderAndTheBodyVerbatim() throws Exception {
         HttpClient httpClient = mock(HttpClient.class);
         doReturn(fakeResponse(200, "", Map.of())).when(httpClient).send(any(), any());
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES);
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES, METER_REGISTRY);
 
         WebhookRequest request = new WebhookRequest(
                 "https://example.com/hook",
@@ -116,7 +119,7 @@ class JdkWebhookClientAdapterTest {
     void anHttpTargetIsSentUnchanged_theAdapterNoLongerRejectsItItself() throws Exception {
         HttpClient httpClient = mock(HttpClient.class);
         doReturn(fakeResponse(200, "", Map.of())).when(httpClient).send(any(), any());
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES);
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES, METER_REGISTRY);
 
         WebhookResponse response = adapter.send(webhookRequest("http://example.com/hook"));
 
@@ -128,7 +131,7 @@ class JdkWebhookClientAdapterTest {
     @Test
     void theAdapterNeverThrowsRegardlessOfTheUrlHandedToIt() {
         HttpClient httpClient = mock(HttpClient.class);
-        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES);
+        JdkWebhookClientAdapter adapter = new JdkWebhookClientAdapter(httpClient, WORKER_PROPERTIES, METER_REGISTRY);
 
         WebhookResponse response = adapter.send(webhookRequest("http://[::1"));
 
