@@ -19,6 +19,7 @@ import com.cobre.challenge.domain.model.delivery.DeliveryAttempt;
 import com.cobre.challenge.domain.policy.AttemptOutcome;
 import com.cobre.challenge.domain.policy.RetryPolicy;
 import com.cobre.challenge.domain.policy.TransportFailure;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
@@ -54,8 +55,10 @@ class DeliveryOutcomeWriterTest {
             Duration.ofHours(1),
             1024);
 
-    private final DeliveryOutcomeWriter writer =
-            new DeliveryOutcomeWriter(attemptPort, pipelinePort, subscriptionPort, retryPolicy, workerProperties);
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    private final DeliveryOutcomeWriter writer = new DeliveryOutcomeWriter(
+            attemptPort, pipelinePort, subscriptionPort, retryPolicy, workerProperties, meterRegistry);
 
     @Test
     void scenario1_successMarksDeliveredInsertsOneAttemptRowAndTouchesNoSubscription() {
@@ -198,14 +201,45 @@ class DeliveryOutcomeWriterTest {
 
     @Test
     void scenario8_successfulProbeClosesTheCircuitInAdditionToMarkingDelivered() {
+        when(subscriptionPort.closeCircuit(SUBSCRIPTION_ID, ATTEMPTED_AT)).thenReturn(true);
+
         writer.write(aCommand().outcome(AttemptOutcome.SUCCESS).httpStatus(200).wasHalfOpenProbe(true).build());
 
         verify(pipelinePort, times(1)).markDelivered(DELIVERY_ID, ATTEMPTED_AT);
         verify(subscriptionPort, times(1)).closeCircuit(SUBSCRIPTION_ID, ATTEMPTED_AT);
     }
 
+    /**
+     * ADR-002 §3's four-directions requirement: the probe's own outcome (the other half of the
+     * circuit lifecycle, beyond the worker's trip and the relay's promotion) must be visible in
+     * Grafana too - a Half_Open->Closed row with nothing feeding it is not testable operationally.
+     */
+    @Test
+    void scenario8b_successfulProbeIncrementsTheHalfOpenToClosedCircuitTransitionCounter() {
+        when(subscriptionPort.closeCircuit(SUBSCRIPTION_ID, ATTEMPTED_AT)).thenReturn(true);
+
+        writer.write(aCommand().outcome(AttemptOutcome.SUCCESS).httpStatus(200).wasHalfOpenProbe(true).build());
+
+        assertThat(meterRegistry.counter("notification.circuit.transition", "direction", "HALF_OPEN_TO_CLOSED")
+                .count()).isEqualTo(1.0);
+    }
+
+    /** A lost first-writer-wins race must not count as a transition that never actually landed. */
+    @Test
+    void scenario8c_aLostCloseCircuitRaceDoesNotIncrementTheCounter() {
+        when(subscriptionPort.closeCircuit(SUBSCRIPTION_ID, ATTEMPTED_AT)).thenReturn(false);
+
+        writer.write(aCommand().outcome(AttemptOutcome.SUCCESS).httpStatus(200).wasHalfOpenProbe(true).build());
+
+        assertThat(meterRegistry.counter("notification.circuit.transition", "direction", "HALF_OPEN_TO_CLOSED")
+                .count()).isEqualTo(0.0);
+    }
+
     @Test
     void scenario9_failedProbeReopensTheCircuitWithBaseAndMaxCooldownFromProperties() {
+        when(subscriptionPort.reopenCircuit(SUBSCRIPTION_ID, BASE_COOLDOWN, MAX_COOLDOWN, ATTEMPTED_AT))
+                .thenReturn(true);
+
         writer.write(aCommand()
                 .outcome(AttemptOutcome.RETRYABLE)
                 .httpStatus(500)
@@ -214,6 +248,22 @@ class DeliveryOutcomeWriterTest {
                 .build());
 
         verify(subscriptionPort, times(1)).reopenCircuit(SUBSCRIPTION_ID, BASE_COOLDOWN, MAX_COOLDOWN, ATTEMPTED_AT);
+    }
+
+    @Test
+    void scenario9b_failedProbeIncrementsTheHalfOpenToOpenCircuitTransitionCounter() {
+        when(subscriptionPort.reopenCircuit(SUBSCRIPTION_ID, BASE_COOLDOWN, MAX_COOLDOWN, ATTEMPTED_AT))
+                .thenReturn(true);
+
+        writer.write(aCommand()
+                .outcome(AttemptOutcome.RETRYABLE)
+                .httpStatus(500)
+                .currentAttemptCount(0)
+                .wasHalfOpenProbe(true)
+                .build());
+
+        assertThat(meterRegistry.counter("notification.circuit.transition", "direction", "HALF_OPEN_TO_OPEN")
+                .count()).isEqualTo(1.0);
     }
 
     @ParameterizedTest

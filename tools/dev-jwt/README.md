@@ -18,34 +18,41 @@ the artifact cannot be loaded by the artifact.
 
 ## Minting a token
 
+There is no shell script here anymore — mint a token over HTTP instead, against the running app
+(`POST /local/dev-token`, local profile only, `adapter/in/web/local/devtoken`). It signs with the
+same key pair above and produces the same claim shape:
+
+```bash
+curl -X POST http://localhost:8080/local/dev-token \
+  -H 'Content-Type: application/json' \
+  -d '{"clientId": "CLIENT001", "scope": "notifications:read notifications:replay"}'
 ```
-./issue-token.sh --client-id CLIENT001 --scope "notifications:read"
+
+Returns `{token, clientId, scope, expiresAt}`. Compose directly:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/local/dev-token -H 'Content-Type: application/json' \
+  -d '{"clientId": "CLIENT001"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/notification_events
 ```
 
-Prints a single RS256 JWT on stdout and nothing else, so it composes directly:
+`clientId` is required. `scope` defaults to `"notifications:read notifications:replay"` if
+omitted. Default token lifetime is 1 hour, which is also the hard ceiling — a longer
+`lifetimeSeconds` in the request body is silently clamped to it, not rejected.
 
-```
-curl -H "Authorization: Bearer $(./issue-token.sh --client-id CLIENT001 --scope "notifications:read")" \
-  http://localhost:8080/notification_events
-```
+From Insomnia: the "Dev Token" folder's "Issue Dev Token (POST)" request does this and
+auto-writes the result into the `jwt_token` environment variable — see the repo root `README.md`.
 
-No IdP is involved anywhere in this flow.
+**Requires the app running** (unlike the old shell script, which only needed the key file). If you
+need a token without the app up — e.g. scripting something before `bootRun` finishes — that path
+no longer exists; start the app first.
 
-`--client-id` is required; the script refuses to emit a token without it. `--scope` accepts
-`notifications:read`, `notifications:replay`, or both space-delimited in one string. Default
-token lifetime is 1 hour, which is also the hard ceiling (`--lifetime` cannot exceed it).
+## Negative-test tokens (wrong audience, expired, missing `client_id`)
 
-## Negative-test flags
-
-For the 401 test paths in TASK-008-20 / TASK-008-28:
-
-| Flag | Effect |
-|---|---|
-| `--wrong-audience` | signs the token with an audience that will not match the configured one |
-| `--expired` | signs a token whose `exp` is already in the past |
-| `--omit-client-id` | omits the `client_id` claim entirely |
-
-Each flag changes only the one thing it names; none weaken the default (valid) output.
+Not available through `/local/dev-token`. These exist only in the automated test suite (see
+`JwtClaimValidatorsTest` and similar), which builds malformed tokens directly rather than through
+either tool. Nothing in `src/test` ever shelled out to a script for this, so removing it changed
+no test.
 
 ## Regenerating the key pair
 

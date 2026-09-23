@@ -18,8 +18,8 @@ services:
     image: 'grafana/otel-lgtm:latest'
     ports:
       - '3000:3000'
-      - '4317'
-      - '4318'
+      - '4317:4317'
+      - '4318:4318'
     volumes:
       - './docker/grafana/dashboards:/otel-lgtm/custom-dashboards:ro'
       - './docker/grafana/provisioning/dashboards/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/dashboards.yaml:ro'
@@ -30,4 +30,4 @@ services:
       - 'POSTGRES_PASSWORD=secret'
       - 'POSTGRES_USER=myuser'
     ports:
-      - '5432'
+      - '5432:5432'

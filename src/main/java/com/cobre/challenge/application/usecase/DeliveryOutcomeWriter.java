@@ -9,6 +9,7 @@ import com.cobre.challenge.domain.model.delivery.DeliveryAttempt;
 import com.cobre.challenge.domain.policy.AttemptOutcome;
 import com.cobre.challenge.domain.policy.RetryPolicy;
 import com.cobre.challenge.domain.policy.TransportFailure;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Instant;
 import java.util.Optional;
 import org.slf4j.Logger;
@@ -37,18 +38,21 @@ public class DeliveryOutcomeWriter {
     private final SubscriptionRepositoryPort subscriptionPort;
     private final RetryPolicy retryPolicy;
     private final WorkerProperties workerProperties;
+    private final MeterRegistry meterRegistry;
 
     public DeliveryOutcomeWriter(
             DeliveryAttemptRepositoryPort attemptPort,
             DeliveryPipelineRepositoryPort pipelinePort,
             SubscriptionRepositoryPort subscriptionPort,
             RetryPolicy retryPolicy,
-            WorkerProperties workerProperties) {
+            WorkerProperties workerProperties,
+            MeterRegistry meterRegistry) {
         this.attemptPort = attemptPort;
         this.pipelinePort = pipelinePort;
         this.subscriptionPort = subscriptionPort;
         this.retryPolicy = retryPolicy;
         this.workerProperties = workerProperties;
+        this.meterRegistry = meterRegistry;
     }
 
     @Transactional
@@ -111,17 +115,31 @@ public class DeliveryOutcomeWriter {
         tolerate(pipelinePort.markDead(command.deliveryId(), error, command.attemptedAt()));
     }
 
+    /**
+     * ADR-002 §3 requires all four circuit-state transitions instrumented by direction; only
+     * {@code CLOSED_TO_OPEN} (worker trip) and {@code OPEN_TO_HALF_OPEN} (relay promotion) had a
+     * counter until this fix - the probe's own outcome, the other half of the circuit's lifecycle
+     * (did it recover, or fail again), was invisible in Grafana. Incremented only on a successful
+     * conditional write (never on a lost first-writer-wins race, ADR-006 §1.2), matching the
+     * {@code OPEN_TO_HALF_OPEN} counter's convention of counting confirmed DB transitions.
+     */
     private void applyProbeCircuitTransition(AttemptOutcomeCommand command) {
         AttemptOutcome outcome = command.outcome();
         if (outcome == AttemptOutcome.SUCCESS) {
-            tolerate(subscriptionPort.closeCircuit(command.subscriptionId(), command.attemptedAt()));
+            if (tolerate(subscriptionPort.closeCircuit(command.subscriptionId(), command.attemptedAt()))) {
+                meterRegistry.counter("notification.circuit.transition", "direction", "HALF_OPEN_TO_CLOSED")
+                        .increment();
+            }
         } else if (outcome.countsTowardCircuitBreaker()) {
             WorkerProperties.CircuitBreaker circuitBreaker = workerProperties.circuitBreaker();
-            tolerate(subscriptionPort.reopenCircuit(
+            if (tolerate(subscriptionPort.reopenCircuit(
                     command.subscriptionId(),
                     circuitBreaker.baseCooldown(),
                     circuitBreaker.maxCooldown(),
-                    command.attemptedAt()));
+                    command.attemptedAt()))) {
+                meterRegistry.counter("notification.circuit.transition", "direction", "HALF_OPEN_TO_OPEN")
+                        .increment();
+            }
         }
     }
 
@@ -147,10 +165,16 @@ public class DeliveryOutcomeWriter {
         return value.length() <= ERROR_MAX ? value : value.substring(0, ERROR_MAX);
     }
 
-    /** A false conditional write is a lost race, not an error: log and move on, never throw or retry the write. */
-    private static void tolerate(boolean written) {
+    /**
+     * A false conditional write is a lost race, not an error: log and move on, never throw or
+     * retry the write. Returns the same boolean so callers that need to know whether their own
+     * write actually landed (e.g. to gate a metric on a confirmed transition, not an attempted
+     * one) can branch on the return value instead of re-deriving it.
+     */
+    private static boolean tolerate(boolean written) {
         if (!written) {
             log.debug("Conditional write affected no row");
         }
+        return written;
     }
 }

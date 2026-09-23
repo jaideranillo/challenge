@@ -24,6 +24,7 @@ import com.cobre.challenge.application.port.out.persistence.SubscriptionReposito
 import com.cobre.challenge.application.port.out.resilience.BulkheadPort;
 import com.cobre.challenge.application.port.out.resilience.CircuitBreakerPort;
 import com.cobre.challenge.application.port.out.secrets.WebhookSecretPort;
+import com.cobre.challenge.application.port.out.tracing.TraceContextPort;
 import com.cobre.challenge.application.port.out.webhook.WebhookClientPort;
 import com.cobre.challenge.application.port.out.webhook.WebhookEnvelopeSerializerPort;
 import com.cobre.challenge.application.port.out.webhook.dto.WebhookEnvelope;
@@ -90,6 +91,7 @@ class AttemptDeliveryUseCaseImplTest {
     private OutboundUrlValidator urlValidator;
     private DeliveryOutcomeWriter outcomeWriter;
     private SimpleMeterRegistry meterRegistry;
+    private TraceContextPort traceContextPort;
     private AttemptDeliveryUseCaseImpl useCase;
 
     @BeforeEach
@@ -105,6 +107,8 @@ class AttemptDeliveryUseCaseImplTest {
         urlValidator = mock(OutboundUrlValidator.class);
         outcomeWriter = mock(DeliveryOutcomeWriter.class);
         meterRegistry = new SimpleMeterRegistry();
+        traceContextPort = mock(TraceContextPort.class);
+        when(traceContextPort.currentTraceparent()).thenReturn(Optional.empty());
 
         when(pipelinePort.claimForProcessing(any(), any())).thenReturn(true);
         when(pipelinePort.findById(DELIVERY_ID)).thenReturn(Optional.of(delivery()));
@@ -117,7 +121,7 @@ class AttemptDeliveryUseCaseImplTest {
         useCase = new AttemptDeliveryUseCaseImpl(
                 pipelinePort, subscriptionPort, eventPort, bulkheadPort, circuitBreakerPort, secretPort,
                 serializerPort, webhookClientPort, urlValidator, outcomeWriter, workerProperties(),
-                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), RandomGenerator.getDefault());
+                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), RandomGenerator.getDefault(), traceContextPort);
     }
 
     @Test
@@ -329,7 +333,7 @@ class AttemptDeliveryUseCaseImplTest {
         AttemptDeliveryUseCaseImpl scenarioUseCase = new AttemptDeliveryUseCaseImpl(
                 pipelinePort, subscriptionPort, eventPort, bulkheadPort, fakeBreaker, secretPort,
                 serializerPort, webhookClientPort, urlValidator, outcomeWriter, workerProperties(),
-                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), RandomGenerator.getDefault());
+                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), RandomGenerator.getDefault(), traceContextPort);
         when(urlValidator.validate(anyString())).thenReturn(EgressVerdict.allowed());
         when(webhookClientPort.send(any()))
                 .thenReturn(new WebhookResponse(500, TransportFailure.NONE, 12, Optional.empty(), 0, Optional.empty()));
@@ -533,7 +537,7 @@ class AttemptDeliveryUseCaseImplTest {
         return new AttemptDeliveryUseCaseImpl(
                 pipelinePort, subscriptionPort, eventPort, bulkheadPort, circuitBreakerPort, secretPort,
                 serializerPort, webhookClientPort, urlValidator, outcomeWriter, workerProperties(),
-                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), randomGenerator);
+                meterRegistry, Clock.fixed(NOW, ZoneOffset.UTC), randomGenerator, traceContextPort);
     }
 
     private static AttemptDeliveryCommand command() {

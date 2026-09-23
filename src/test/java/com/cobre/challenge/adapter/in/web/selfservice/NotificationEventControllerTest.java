@@ -30,6 +30,7 @@ import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.DeliveryAttempt;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryOrigin;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.delivery.enums.PublicDeliveryStatus;
 import com.cobre.challenge.domain.model.event.NotificationEvent;
 import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Clock;
@@ -85,6 +86,53 @@ class NotificationEventControllerTest {
         assertThat(response.getBody().nextCursor()).contains("next-cursor");
     }
 
+    /**
+     * Regression: a malformed {@code delivery_status} must be a clean 400 from inside this
+     * handler, never left to Spring MVC's enum-binding machinery to throw
+     * {@code MethodArgumentTypeMismatchException} - that path resolves via the servlet
+     * container's internal {@code /error} forward, which re-enters Spring Security's filter
+     * chain, matches no client-API chain, and falls through to the terminal {@code denyAll()},
+     * producing a stray 403. Same failure class already fixed for the
+     * {@code notification_event_id} path variable.
+     */
+    @Test
+    void listReturns400ForAMalformedDeliveryStatus_notForbidden() {
+        ListNotificationEventsRequest request = new ListNotificationEventsRequest(
+                Optional.empty(), Optional.empty(), Optional.of("bogus"), Optional.empty(), 50);
+
+        ResponseEntity<ListNotificationEventsResponse> response = controller.list(request, TENANT);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(queryUseCase);
+    }
+
+    /** Regression: the internal enum name is not a valid wire value (ADR-003 §1.1). */
+    @Test
+    void listReturns400WhenGivenTheInternalEnumNameInsteadOfThePublicVocabulary() {
+        ListNotificationEventsRequest request = new ListNotificationEventsRequest(
+                Optional.empty(), Optional.empty(), Optional.of("DELIVERED"), Optional.empty(), 50);
+
+        ResponseEntity<ListNotificationEventsResponse> response = controller.list(request, TENANT);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(queryUseCase);
+    }
+
+    @Test
+    void listAcceptsThePublicVocabularyAndExpandsItToInternalStatesForTheCommand() {
+        when(queryUseCase.query(any(QueryNotificationEventsCommand.class)))
+                .thenReturn(new QueryNotificationEventsResult(List.of(), Optional.empty()));
+        ListNotificationEventsRequest request = new ListNotificationEventsRequest(
+                Optional.empty(), Optional.empty(), Optional.of("pending"), Optional.empty(), 50);
+
+        ResponseEntity<ListNotificationEventsResponse> response = controller.list(request, TENANT);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(queryUseCase).query(new QueryNotificationEventsCommand(
+                TENANT, Optional.empty(), Optional.empty(), Optional.of(PublicDeliveryStatus.PENDING),
+                Optional.empty(), 50));
+    }
+
     @Test
     void listHasNoNextCursorOnTheLastPage() {
         when(queryUseCase.query(any(QueryNotificationEventsCommand.class)))
@@ -105,13 +153,14 @@ class NotificationEventControllerTest {
         Instant from = Instant.parse("2026-09-01T00:00:00Z");
         Instant to = Instant.parse("2026-09-21T00:00:00Z");
         ListNotificationEventsRequest request = new ListNotificationEventsRequest(
-                Optional.of(from), Optional.of(to), Optional.of(DeliveryStatus.DELIVERED), Optional.of("cur-1"), 50);
+                Optional.of(from), Optional.of(to), Optional.of("completed"), Optional.of("cur-1"), 50);
 
         controller.list(request, TENANT);
 
         verify(queryUseCase)
                 .query(new QueryNotificationEventsCommand(
-                        TENANT, Optional.of(from), Optional.of(to), Optional.of(DeliveryStatus.DELIVERED), Optional.of("cur-1"), 50));
+                        TENANT, Optional.of(from), Optional.of(to), Optional.of(PublicDeliveryStatus.COMPLETED),
+                        Optional.of("cur-1"), 50));
     }
 
     @Test
@@ -139,7 +188,7 @@ class NotificationEventControllerTest {
         when(getUseCase.get(new GetNotificationEventCommand(deliveryId, TENANT)))
                 .thenReturn(Optional.of(new NotificationEventDetail(delivery, event, List.of(attempt1, attempt2))));
 
-        ResponseEntity<NotificationEventDetailResponse> response = controller.get(deliveryId, TENANT);
+        ResponseEntity<NotificationEventDetailResponse> response = controller.get(deliveryId.toString(), TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody().delivery().deliveryId()).isEqualTo(deliveryId);
@@ -154,10 +203,37 @@ class NotificationEventControllerTest {
         UUID deliveryId = UUID.randomUUID();
         when(getUseCase.get(new GetNotificationEventCommand(deliveryId, TENANT))).thenReturn(Optional.empty());
 
-        ResponseEntity<NotificationEventDetailResponse> response = controller.get(deliveryId, TENANT);
+        ResponseEntity<NotificationEventDetailResponse> response = controller.get(deliveryId.toString(), TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(response.getBody()).isNull();
+    }
+
+    /**
+     * Regression: a malformed id must read as "not found" (404), never as "forbidden" (403).
+     * Before this fix, {@code @PathVariable UUID} binding failed inside Spring MVC's argument
+     * resolution (before this method ran), and the servlet container's internal error dispatch
+     * for that failure re-entered Spring Security's filter chain against {@code /error} - which
+     * matches no client-API chain and falls through to the terminal {@code denyAll()} - producing
+     * a stray 403. See ADR-007 §5.5: a foreign or malformed id must never be distinguishable from
+     * a well-formed nonexistent one.
+     */
+    @Test
+    void getReturns404ForAMalformedId_notForbidden() {
+        ResponseEntity<NotificationEventDetailResponse> response = controller.get("not-a-uuid", TENANT);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).isNull();
+        verifyNoInteractions(getUseCase);
+    }
+
+    @Test
+    void replayReturns404ForAMalformedId_notForbidden() {
+        ResponseEntity<Object> response = controller.replay("not-a-uuid", "idem-key-1", TENANT);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).isNull();
+        verifyNoInteractions(replayUseCase);
     }
 
     @Test
@@ -165,7 +241,7 @@ class NotificationEventControllerTest {
         UUID deliveryId = UUID.randomUUID();
         when(getUseCase.get(any(GetNotificationEventCommand.class))).thenReturn(Optional.empty());
 
-        controller.get(deliveryId, TENANT);
+        controller.get(deliveryId.toString(), TENANT);
 
         verify(getUseCase).get(new GetNotificationEventCommand(deliveryId, TENANT));
     }
@@ -177,12 +253,12 @@ class NotificationEventControllerTest {
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
                 .thenReturn(new Accepted(newDeliveryId, DeliveryStatus.PENDING, Optional.empty()));
 
-        ResponseEntity<Object> response = controller.replay(originalId, "idem-key-1", TENANT);
+        ResponseEntity<Object> response = controller.replay(originalId.toString(), "idem-key-1", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         ReplayAcceptedResponse body = (ReplayAcceptedResponse) response.getBody();
         assertThat(body.deliveryId()).isEqualTo(newDeliveryId);
-        assertThat(body.status()).isEqualTo(DeliveryStatus.PENDING);
+        assertThat(body.status()).isEqualTo(PublicDeliveryStatus.PENDING);
     }
 
     @Test
@@ -190,7 +266,7 @@ class NotificationEventControllerTest {
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
                 .thenReturn(new Rejected(RejectionReason.TARGET_NOT_FOUND));
 
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), "idem-key-1", TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), "idem-key-1", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(response.getBody()).isNull();
@@ -201,7 +277,7 @@ class NotificationEventControllerTest {
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
                 .thenReturn(new Rejected(RejectionReason.TARGET_NOT_DEAD));
 
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), "idem-key-1", TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), "idem-key-1", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(response.getBody()).isNull();
@@ -212,14 +288,14 @@ class NotificationEventControllerTest {
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
                 .thenReturn(new Rejected(RejectionReason.LIVE_OR_DELIVERED_ROW_ALREADY_EXISTS));
 
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), "idem-key-1", TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), "idem-key-1", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
     }
 
     @Test
     void replayReturns400AndDoesNotCallTheUseCaseWhenTheHeaderIsMissing() {
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), null, TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), null, TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         verifyNoInteractions(replayUseCase);
@@ -227,7 +303,7 @@ class NotificationEventControllerTest {
 
     @Test
     void replayReturns400AndDoesNotCallTheUseCaseWhenTheHeaderIsBlank() {
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), "   ", TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), "   ", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         verify(replayUseCase, never()).replay(any());
@@ -235,7 +311,7 @@ class NotificationEventControllerTest {
 
     @Test
     void replayReturns400AndDoesNotCallTheUseCaseWhenTheHeaderIsMalformed() {
-        ResponseEntity<Object> response = controller.replay(UUID.randomUUID(), "bad key\nwith control chars", TENANT);
+        ResponseEntity<Object> response = controller.replay(UUID.randomUUID().toString(), "bad key\nwith control chars", TENANT);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         verify(replayUseCase, never()).replay(any());
@@ -247,7 +323,7 @@ class NotificationEventControllerTest {
         when(replayUseCase.replay(any(ReplayDeliveryCommand.class)))
                 .thenReturn(new Rejected(RejectionReason.TARGET_NOT_FOUND));
 
-        controller.replay(deliveryId, "idem-key-1", TENANT);
+        controller.replay(deliveryId.toString(), "idem-key-1", TENANT);
 
         verify(replayUseCase).replay(new ReplayDeliveryCommand(deliveryId, TENANT, "idem-key-1"));
     }

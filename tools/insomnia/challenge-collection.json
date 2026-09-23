@@ -35,10 +35,13 @@
       "name": "Local",
       "data": {
         "base_url": "http://localhost:8080",
-        "jwt_token": "PASTE_TOKEN_FROM_tools/dev-jwt/issue-token.sh"
+        "jwt_token": "SET_VIA_DEV_TOKEN_REQUEST_OR_PASTE_HERE"
       },
       "dataPropertyOrder": {
-        "&": ["base_url", "jwt_token"]
+        "&": [
+          "base_url",
+          "jwt_token"
+        ]
       },
       "color": "#4CAF50",
       "isPrivate": false,
@@ -72,8 +75,14 @@
       },
       "parameters": [],
       "headers": [
-        { "name": "Content-Type", "value": "application/json" },
-        { "name": "X-Webhook-Signature", "value": "test-signature" }
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Webhook-Signature",
+          "value": "test-signature"
+        }
       ],
       "authentication": {},
       "metaSortKey": -1758326400000,
@@ -212,7 +221,10 @@
       "method": "POST",
       "body": {},
       "parameters": [
-        { "name": "millis", "value": "8000" }
+        {
+          "name": "millis",
+          "value": "8000"
+        }
       ],
       "headers": [],
       "authentication": {},
@@ -267,7 +279,7 @@
       "modified": 1758585600000,
       "created": 1758585600000,
       "name": "Generate Events (POST)",
-      "description": "Registers `count` synthetic notification events (1-1000), cycling through the sample event types/content from notification_events.json with random CLIENT001/002/003 assignment. Returns the generated eventIds.",
+      "description": "Registers count synthetic notification events (1-1000), cycling through the sample event types/content from notification_events.json with random CLIENT001/002/003 assignment. Returns each generated event with its assigned clientId (use that clientId to mint a matching token via Dev Token, then query it back via GET /notification_events).",
       "url": "{{ _.base_url }}/local/event-generator/generate",
       "method": "POST",
       "body": {
@@ -275,7 +287,12 @@
         "text": "{\n  \"count\": 20\n}"
       },
       "parameters": [],
-      "headers": [{ "name": "Content-Type", "value": "application/json" }],
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
       "authentication": {},
       "metaSortKey": -1758585600000,
       "isPrivate": false,
@@ -313,7 +330,12 @@
         "text": "{\n  \"eventId\": \"EVT001\",\n  \"clientId\": \"CLIENT001\",\n  \"eventType\": \"credit_card_payment\",\n  \"content\": \"Credit card payment received for $150.00\",\n  \"occurredAt\": \"2024-03-15T09:30:22Z\"\n}"
       },
       "parameters": [],
-      "headers": [{ "name": "Content-Type", "value": "application/json" }],
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
       "authentication": {},
       "metaSortKey": -1758585500000,
       "isPrivate": false,
@@ -331,7 +353,7 @@
       "modified": 1758585600000,
       "created": 1758585600000,
       "name": "Self-Service API (adapter/in/web/selfservice, ADR-005/007)",
-      "description": "/notification_events. Needs a bearer JWT with the matching scope. Mint one with tools/dev-jwt/issue-token.sh --client-id CLIENT001 --scope \"notifications:read notifications:replay\", then paste it into the jwt_token environment variable.",
+      "description": "/notification_events. Needs a bearer JWT with the matching scope. Mint one with the \"Dev Token\" folder's Issue Dev Token request (auto-fills jwt_token), or POST /local/dev-token directly.",
       "environment": {},
       "environmentPropertyOrder": null,
       "metaSortKey": -1758585400000
@@ -348,11 +370,28 @@
       "method": "GET",
       "body": {},
       "parameters": [
-        { "name": "delivery_status", "value": "completed", "disabled": true },
-        { "name": "limit", "value": "20", "disabled": true },
-        { "name": "cursor", "value": "", "disabled": true }
+        {
+          "name": "delivery_status",
+          "value": "completed",
+          "disabled": true
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
       ],
-      "headers": [{ "name": "Authorization", "value": "Bearer {{ _.jwt_token }}" }],
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
       "authentication": {},
       "metaSortKey": -1758585400000,
       "isPrivate": false,
@@ -375,7 +414,12 @@
       "method": "GET",
       "body": {},
       "parameters": [],
-      "headers": [{ "name": "Authorization", "value": "Bearer {{ _.jwt_token }}" }],
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
       "authentication": {},
       "metaSortKey": -1758585399000,
       "isPrivate": false,
@@ -399,8 +443,14 @@
       "body": {},
       "parameters": [],
       "headers": [
-        { "name": "Authorization", "value": "Bearer {{ _.jwt_token }}" },
-        { "name": "Idempotency-Key", "value": "replay-key-001" }
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        },
+        {
+          "name": "Idempotency-Key",
+          "value": "replay-key-001"
+        }
       ],
       "authentication": {},
       "metaSortKey": -1758585398000,
@@ -411,6 +461,363 @@
       "settingEncodeUrl": true,
       "settingRebuildPath": true,
       "settingFollowRedirects": "global"
+    },
+    {
+      "_id": "fld_dev_token",
+      "_type": "request_group",
+      "parentId": "wrk_challenge",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "name": "Dev Token (local profile only)",
+      "description": "Mints a local test JWT via HTTP (adapter/in/web/local/devtoken), signed with the dev key pair in tools/dev-jwt/. No auth needed to call this - it plays the role of the IdP.",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": -1758585600100
+    },
+    {
+      "_id": "req_dev_token",
+      "_type": "request",
+      "parentId": "fld_dev_token",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "name": "Issue Dev Token (POST)",
+      "description": "Returns { token, clientId, scope, expiresAt } and auto-saves \"token\" into this environment's jwt_token variable (afterResponseScript) - no manual copy-paste needed. Any request under Self-Service API picks it up immediately via Authorization: Bearer {{ _.jwt_token }}. Re-run with a different clientId to switch tenants.",
+      "url": "{{ _.base_url }}/local/dev-token",
+      "method": "POST",
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"clientId\": \"CLIENT001\",\n  \"scope\": \"notifications:read notifications:replay\"\n}"
+      },
+      "parameters": [],
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "authentication": {},
+      "metaSortKey": -1758585600000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "afterResponseScript": "const body = insomnia.response.json();\nif (body && body.token) {\n  insomnia.environment.set(\"jwt_token\", body.token);\n  console.log(\"jwt_token set for client \" + body.clientId + \", expires \" + body.expiresAt);\n} else {\n  console.log(\"Dev token response had no token field - jwt_token not updated\");\n}"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_status_pending",
+      "name": "List — delivery_status=pending (expands to 4 internal states)",
+      "description": "ADR-003 §1: pending -> PENDING, QUEUED, PROCESSING, RETRYING (all in one filter).",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "delivery_status",
+          "value": "pending"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390000,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_status_completed",
+      "name": "List — delivery_status=completed (1:1 with DELIVERED)",
+      "description": "ADR-003 §1: completed -> DELIVERED only.",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "delivery_status",
+          "value": "completed"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390100,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_status_failed",
+      "name": "List — delivery_status=failed (expands to DEAD + FAILED)",
+      "description": "ADR-003 §1: failed -> DEAD, FAILED (both, one filter).",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "delivery_status",
+          "value": "failed"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390200,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_status_bogus",
+      "name": "List — delivery_status=bogus (expect 400, never 403)",
+      "description": "Regression: an unrecognized value must be a clean 400 from the controller, not a stray 403 (the MethodArgumentTypeMismatchException -> /error-forward -> terminal denyAll() failure mode fixed this session).",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "delivery_status",
+          "value": "bogus"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390300,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_status_internal_name",
+      "name": "List — delivery_status=DELIVERED (internal enum name, expect 400)",
+      "description": "Regression: the internal 7-state enum name is never a valid wire value (ADR-003 §1.1 - the internal enum never reaches the client). Only pending/completed/failed are accepted.",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "delivery_status",
+          "value": "DELIVERED"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390400,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_date_range",
+      "name": "List — created_from + created_to (date range only)",
+      "description": "ADR-005 §1: filters by deliveries.event_created_at (the event's own timestamp, not the row's created_at - matters for replayed rows). Default window is 30 days when both are omitted.",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "created_from",
+          "value": "2026-09-23T00:00:00Z"
+        },
+        {
+          "name": "created_to",
+          "value": "2026-09-24T00:00:00Z"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390500,
+      "_type": "request"
+    },
+    {
+      "parentId": "fld_selfservice",
+      "modified": 1758585600000,
+      "created": 1758585600000,
+      "method": "GET",
+      "body": {},
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {{ _.jwt_token }}"
+        }
+      ],
+      "authentication": {},
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_id": "req_selfservice_list_date_and_status",
+      "name": "List — date range + delivery_status combined",
+      "description": "Both filters apply together (AND), per ADR-005 §1's filter criteria.",
+      "url": "{{ _.base_url }}/notification_events",
+      "parameters": [
+        {
+          "name": "created_from",
+          "value": "2026-09-23T00:00:00Z"
+        },
+        {
+          "name": "created_to",
+          "value": "2026-09-24T00:00:00Z"
+        },
+        {
+          "name": "delivery_status",
+          "value": "completed"
+        },
+        {
+          "name": "limit",
+          "value": "20",
+          "disabled": true
+        },
+        {
+          "name": "cursor",
+          "value": "",
+          "disabled": true
+        }
+      ],
+      "metaSortKey": -1758585390600,
+      "_type": "request"
     }
   ]
 }

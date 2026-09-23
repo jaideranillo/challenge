@@ -478,6 +478,125 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Main queue depth (deliveries)",
+      "description": "notification.delivery.queue.depth (visible) and notification.delivery.queue.in_flight (received, not yet deleted) are gauges polled from SQS GetQueueAttributes on the deliveries queue, same pattern as the DLQ depth gauge (not originally in ADR-008 scope, added for live queue visibility). STALE on a failed poll, NaN if never succeeded - a flat line is not automatically \"queue is empty\", check poll-failure logs first.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "notification_delivery_queue_depth",
+          "legendFormat": "Visible (waiting)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "notification_delivery_queue_in_flight",
+          "legendFormat": "In-flight (received)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Circuit breaker and client reachability",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Circuit breaker transitions by direction",
+      "description": "notification.circuit.transition, tagged by direction (ADR-002 §3, ADR-006 §1.2). CLOSED_TO_OPEN = a worker tripped its local breaker (10 consecutive breaker-counting failures in production, 3 in the local profile). OPEN_TO_HALF_OPEN = the relay promoted a cooled-down subscription and admitted one probe. HALF_OPEN_TO_CLOSED = the probe succeeded, circuit recovered. HALF_OPEN_TO_OPEN = the probe failed again, cooldown escalates. A rising HALF_OPEN_TO_OPEN rate relative to HALF_OPEN_TO_CLOSED means a client has been down a long time, not flapping.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(notification_circuit_transition_total[$__rate_interval])) by (direction)",
+          "legendFormat": "{{direction}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Webhook stub — requests received (local profile only)",
+      "description": "http_server_requests filtered to /local/webhook-stub/receive - confirms the client (the local fake receiver, adapter/in/web/local/webhookstub) is actually being called, not just that the worker claims to be calling it. Split by status: a burst of non-2xx here is you exercising a forced failure (Force Status 500/429/400 in the Webhook Stub Insomnia folder) - expected during a retry-policy demo, not an incident. Absent entirely while the pipeline shows attempts = the worker never reached the client at all (egress block, DNS, wrong target_url).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_milliseconds_count{uri=\"/local/webhook-stub/receive\"}[$__rate_interval])) by (status)",
+          "legendFormat": "status {{status}}",
+          "refId": "A"
+        }
+      ]
     }
   ]
 }

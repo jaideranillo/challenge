@@ -14,8 +14,10 @@ import com.cobre.challenge.application.port.in.selfservice.dto.GetNotificationEv
 import com.cobre.challenge.application.port.in.selfservice.dto.QueryNotificationEventsResult;
 import com.cobre.challenge.application.port.in.selfservice.dto.ReplayDeliveryCommand;
 import com.cobre.challenge.application.usecase.config.SelfServiceQueryProperties;
+import com.cobre.challenge.domain.model.delivery.enums.PublicDeliveryStatus;
 import com.cobre.challenge.domain.model.tenant.TenantId;
 import jakarta.validation.Valid;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -69,16 +71,25 @@ public class NotificationEventController {
     @GetMapping
     public ResponseEntity<ListNotificationEventsResponse> list(
             @Valid @ModelAttribute ListNotificationEventsRequest request, TenantId tenant) {
+        Optional<String> rawStatus = request.deliveryStatus();
+        Optional<PublicDeliveryStatus> status = rawStatus.flatMap(PublicDeliveryStatus::fromWire);
+        if (rawStatus.isPresent() && status.isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
         QueryNotificationEventsResult result =
-                queryUseCase.query(request.toCommand(tenant, queryProperties.defaultPageSize()));
+                queryUseCase.query(request.toCommand(tenant, queryProperties.defaultPageSize(), status));
         return ResponseEntity.ok(ListNotificationEventsResponse.from(result));
     }
 
     @PreAuthorize("hasAuthority('notifications:read')")
     @GetMapping("/{notification_event_id}")
     public ResponseEntity<NotificationEventDetailResponse> get(
-            @PathVariable("notification_event_id") UUID notificationEventId, TenantId tenant) {
-        GetNotificationEventCommand command = new GetNotificationEventCommand(notificationEventId, tenant);
+            @PathVariable("notification_event_id") String notificationEventId, TenantId tenant) {
+        UUID deliveryId = parseOrNull(notificationEventId);
+        if (deliveryId == null) {
+            return ResponseEntity.notFound().build();
+        }
+        GetNotificationEventCommand command = new GetNotificationEventCommand(deliveryId, tenant);
         return getUseCase
                 .get(command)
                 .map(NotificationEventDetailResponse::from)
@@ -98,9 +109,13 @@ public class NotificationEventController {
     @PreAuthorize("hasAuthority('notifications:replay')")
     @PostMapping("/{notification_event_id}/replay")
     public ResponseEntity<Object> replay(
-            @PathVariable("notification_event_id") UUID notificationEventId,
+            @PathVariable("notification_event_id") String notificationEventIdRaw,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
             TenantId tenant) {
+        UUID notificationEventId = parseOrNull(notificationEventIdRaw);
+        if (notificationEventId == null) {
+            return ResponseEntity.notFound().build();
+        }
         if (idempotencyKey == null || !IDEMPOTENCY_KEY_SHAPE.matcher(idempotencyKey).matches()) {
             return ResponseEntity.badRequest().body(null);
         }
@@ -127,5 +142,23 @@ public class NotificationEventController {
             replaySpanRecorder.record(notificationEventId, accepted.originalTraceContext());
         }
         return response;
+    }
+
+    /**
+     * A malformed path segment is treated identically to a well-formed but nonexistent id (404,
+     * never 403/400): the {@code UUID} path variable used to bind directly, and Spring MVC's
+     * argument-resolution failure for it (before this method even ran) surfaced as a stray 403 -
+     * the request's already-passed authorization decision re-evaluated against {@code /error} on
+     * the servlet container's internal error dispatch, which matches no client-API security chain
+     * and falls through to the terminal {@code denyAll()}. Parsing here, inside the already-
+     * authorized handler, keeps the failure mode consistent with ADR-007 §5.5: a foreign or
+     * malformed id both read as "not found", never as "forbidden".
+     */
+    private static UUID parseOrNull(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 }
