@@ -1,6 +1,6 @@
 package com.cobre.challenge.application.port.in.selfservice.dto;
 
-import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.delivery.enums.PublicDeliveryStatus;
 import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Instant;
 import java.util.Objects;
@@ -18,7 +18,7 @@ public record QueryNotificationEventsCommand(
         TenantId tenant,
         Optional<Instant> eventCreatedFrom,
         Optional<Instant> eventCreatedTo,
-        Optional<DeliveryStatus> status,
+        Optional<PublicDeliveryStatus> status,
         Optional<String> cursor,
         int limit) {
 

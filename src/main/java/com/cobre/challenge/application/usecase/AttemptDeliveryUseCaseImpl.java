@@ -12,6 +12,7 @@ import com.cobre.challenge.application.port.out.persistence.SubscriptionReposito
 import com.cobre.challenge.application.port.out.resilience.BulkheadPort;
 import com.cobre.challenge.application.port.out.resilience.CircuitBreakerPort;
 import com.cobre.challenge.application.port.out.secrets.WebhookSecretPort;
+import com.cobre.challenge.application.port.out.tracing.TraceContextPort;
 import com.cobre.challenge.application.port.out.webhook.WebhookClientPort;
 import com.cobre.challenge.application.port.out.webhook.WebhookEnvelopeSerializerPort;
 import com.cobre.challenge.application.port.out.webhook.dto.WebhookEnvelope;
@@ -63,6 +64,7 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
 
     private static final String HEADER_TIMESTAMP = "X-Cobre-Timestamp";
     private static final String HEADER_DELIVERY_ID = "X-Cobre-Delivery-Id";
+    private static final String HEADER_TRACEPARENT = "traceparent";
 
     private static final String METRIC_EGRESS_REJECTED = "notification.webhook.egress.rejected";
 
@@ -87,6 +89,7 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
     private final MeterRegistry meterRegistry;
     private final Clock clock;
     private final RandomGenerator randomGenerator;
+    private final TraceContextPort traceContextPort;
 
     public AttemptDeliveryUseCaseImpl(
             DeliveryPipelineRepositoryPort pipelinePort,
@@ -102,7 +105,8 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
             WorkerProperties workerProperties,
             MeterRegistry meterRegistry,
             Clock clock,
-            RandomGenerator randomGenerator) {
+            RandomGenerator randomGenerator,
+            TraceContextPort traceContextPort) {
         this.pipelinePort = pipelinePort;
         this.subscriptionPort = subscriptionPort;
         this.eventPort = eventPort;
@@ -117,6 +121,7 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
         this.meterRegistry = meterRegistry;
         this.clock = clock;
         this.randomGenerator = randomGenerator;
+        this.traceContextPort = traceContextPort;
     }
 
     /**
@@ -245,6 +250,13 @@ public class AttemptDeliveryUseCaseImpl implements AttemptDeliveryUseCase {
                 new LinkedHashMap<>(WebhookSigner.sign(body, timestamp, secret.get(), previousSecret));
         headers.put(HEADER_TIMESTAMP, timestamp);
         headers.put(HEADER_DELIVERY_ID, delivery.deliveryId().toString());
+        // End-to-end trace continuity into the receiving endpoint: the current span (the
+        // notification.attempt span DeliveryQueueListener opened around this call, ADR-008 §2.4)
+        // continues into whatever auto-instrumented server span the receiver's own HTTP layer
+        // creates on receipt, the same W3C traceparent propagation used at every other hop in
+        // this pipeline. Standard for outbound webhooks, not sensitive (no PII, ADR-008 §3.3's
+        // exemption already covers trace/span ids).
+        traceContextPort.currentTraceparent().ifPresent(tp -> headers.put(HEADER_TRACEPARENT, tp));
 
         // Step 5 (pre-flight): validate the target on every attempt, right before the POST - no
         // cached verdict, which is the DNS-rebinding defense (OutboundUrlValidator's javadoc).

@@ -1,14 +1,16 @@
 package com.cobre.challenge.adapter.in.web.local.eventgenerator;
 
 import com.cobre.challenge.adapter.in.web.ingest.dto.IngestEventRequest;
+import com.cobre.challenge.adapter.in.web.ingest.dto.IngestEventResponse;
 import com.cobre.challenge.adapter.in.web.local.eventgenerator.dto.GenerateEventsRequest;
 import com.cobre.challenge.adapter.in.web.local.eventgenerator.dto.GenerateEventsResponse;
+import com.cobre.challenge.adapter.in.web.local.eventgenerator.dto.GenerateEventsResponse.GeneratedEvent;
 import jakarta.validation.Valid;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -48,6 +50,19 @@ class EventGeneratorController {
 
     private static final List<String> CLIENT_IDS = List.of("CLIENT001", "CLIENT002", "CLIENT003");
 
+    // Same "EVTnnn" shape as docs/challenge/notification_events.json's sample data, deliberately
+    // NOT UUID-shaped (notification_events.event_id is text, ADR-003 §3 - a plain platform-
+    // assigned string, whatever format the upstream producer used; this service never generates
+    // or validates it in the real ingest path, only this demo tool does, for its own synthetic
+    // traffic). A UUID-shaped id is easy to mistake for deliveries.delivery_id, the actual UUID
+    // the self-service API's /{notification_event_id} path expects - that confusion is why this
+    // isn't "EVT-" + UUID.randomUUID(), an earlier version of this tool. Starts at 011, past the
+    // sample file's reserved EVT001-EVT010. Restarting the app resets this to 011 too; a replayed
+    // id just idempotently no-ops (ADR-003 §2's insertIfAbsent), not a bug - re-seed subscriptions
+    // before regenerating if you want fresh deliveries, not fresh event ids.
+    private static final int FIRST_GENERATED_NUMBER = 11;
+    private final AtomicLong sequence = new AtomicLong(FIRST_GENERATED_NUMBER - 1);
+
     private final RestClient restClient;
 
     EventGeneratorController(@Value("${server.port:8080}") int serverPort) {
@@ -57,21 +72,22 @@ class EventGeneratorController {
     @PostMapping("/generate")
     ResponseEntity<GenerateEventsResponse> generate(@Valid @RequestBody GenerateEventsRequest request) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        List<String> eventIds = new ArrayList<>(request.count());
+        List<GeneratedEvent> events = new ArrayList<>(request.count());
         for (int i = 0; i < request.count(); i++) {
             Template template = TEMPLATES.get(random.nextInt(TEMPLATES.size()));
             String clientId = CLIENT_IDS.get(random.nextInt(CLIENT_IDS.size()));
-            String eventId = "EVT-" + UUID.randomUUID();
-            restClient
+            String eventId = String.format("EVT%03d", sequence.incrementAndGet());
+            IngestEventResponse ingestResponse = restClient
                     .post()
                     .uri("/internal/events")
                     .body(
                             new IngestEventRequest(
                                     eventId, clientId, template.eventType(), template.content(), Instant.now()))
                     .retrieve()
-                    .toBodilessEntity();
-            eventIds.add(eventId);
+                    .body(IngestEventResponse.class);
+            events.add(new GeneratedEvent(
+                    eventId, ingestResponse.deliveryIds(), clientId, template.eventType()));
         }
-        return ResponseEntity.ok(new GenerateEventsResponse(request.count(), eventIds.size(), eventIds));
+        return ResponseEntity.ok(new GenerateEventsResponse(request.count(), events.size(), events));
     }
 }

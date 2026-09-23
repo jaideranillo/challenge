@@ -7,7 +7,7 @@ WEBHOOK_SECRET ?= demo-secret-value
 
 # Full local dev stack: infra containers + app (local profile) + demo subscription seed.
 # Re-running is safe: the seed is idempotent (fixed UUIDs, ON CONFLICT DO UPDATE).
-up: infra-up app-up wait-app seed
+up: infra-up wait-queues app-up wait-app seed
 	@echo ""
 	@echo "Ready:"
 	@echo "  App      http://localhost:8080"
@@ -18,6 +18,19 @@ up: infra-up app-up wait-app seed
 infra-up:
 	@mkdir -p .run
 	$(COMPOSE) up -d
+
+# Known race: on a fresh container, the app can start (and its DeliveryDlqConsumer/
+# DeliveryQueueListener beans eagerly resolve queue URLs) before docker/localstack/init-sqs.sh
+# finishes creating the SQS queues, crashing the app before `wait-app`/`seed` ever run.
+wait-queues:
+	@echo "Waiting for LocalStack queues..."
+	@for i in $$(seq 1 30); do \
+		if docker exec challenge-localstack-1 awslocal sqs list-queues 2>/dev/null | grep -q deliveries; then \
+			echo "Queues ready after $$((i*2))s"; exit 0; \
+		fi; \
+		sleep 2; \
+	done; \
+	echo "Queues did not appear in time - check LocalStack logs"; exit 1
 
 app-up:
 	@echo "Starting app (local profile)..."

@@ -7,9 +7,12 @@ import com.cobre.challenge.application.port.out.persistence.DeliveryQueryReposit
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPage;
 import com.cobre.challenge.application.port.out.persistence.dto.DeliveryPageQuery;
 import com.cobre.challenge.application.usecase.config.SelfServiceQueryProperties;
+import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.delivery.enums.PublicDeliveryStatus;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -66,6 +69,7 @@ public class QueryNotificationEventsUseCaseImpl implements QueryNotificationEven
             to = Optional.of(now);
         }
 
-        return new DeliveryPageQuery(from, to, command.status(), command.cursor());
+        Set<DeliveryStatus> statuses = command.status().map(PublicDeliveryStatus::internalStates).orElse(Set.of());
+        return new DeliveryPageQuery(from, to, statuses, command.cursor());
     }
 }

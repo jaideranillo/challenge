@@ -11,8 +11,10 @@ import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -132,7 +134,7 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
 
         Optional<Instant> eventCreatedFrom = query.eventCreatedFrom();
         Optional<Instant> eventCreatedTo = query.eventCreatedTo();
-        Optional<DeliveryStatus> status = query.status();
+        Set<DeliveryStatus> statuses = query.statuses();
         Optional<String> cursor = query.cursor();
 
         MapSqlParameterSource params = new MapSqlParameterSource()
@@ -156,9 +158,19 @@ public class DeliveryQueryJdbcRepository implements DeliveryQueryRepositoryPort 
             params.addValue("event_created_to",
                     OffsetDateTime.ofInstant(eventCreatedTo.get(), ZoneOffset.UTC));
         }
-        if (status.isPresent()) {
-            sql.append(" AND status = :status::delivery_status");
-            params.addValue("status", status.get().name());
+        if (!statuses.isEmpty()) {
+            // Static fragment sized to the set, one named param per state - never a single "=",
+            // since the public delivery_status vocabulary this serves is many-to-one against
+            // these internal states (ADR-003 §1: "pending" alone is 4 of them). Bound params only,
+            // never concatenated (A05).
+            List<String> paramNames = new ArrayList<>(statuses.size());
+            int i = 0;
+            for (DeliveryStatus s : statuses) {
+                String paramName = "status_" + i++;
+                paramNames.add(":" + paramName + "::delivery_status");
+                params.addValue(paramName, s.name());
+            }
+            sql.append(" AND status IN (").append(String.join(", ", paramNames)).append(")");
         }
         if (cursor.isPresent()) {
             // Decode throws MalformedCursorException on invalid input — propagates to the caller.

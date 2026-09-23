@@ -75,7 +75,7 @@ class DeliveryFindPageTest {
                 new DeliveryPageQuery(
                         Optional.of(eventTs.minus(1, ChronoUnit.DAYS)),
                         Optional.of(eventTs.plus(1, ChronoUnit.DAYS)),
-                        Optional.empty(), Optional.empty()),
+                        Set.of(), Optional.empty()),
                 10);
         assertThat(inWindow.deliveries().stream().map(Delivery::deliveryId)).contains(id);
 
@@ -85,7 +85,7 @@ class DeliveryFindPageTest {
                 new DeliveryPageQuery(
                         Optional.of(now.minus(1, ChronoUnit.HOURS)),
                         Optional.of(now.plus(1, ChronoUnit.HOURS)),
-                        Optional.empty(), Optional.empty()),
+                        Set.of(), Optional.empty()),
                 10);
         assertThat(todayWindow.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(id);
     }
@@ -138,7 +138,7 @@ class DeliveryFindPageTest {
         boolean hasMore = true;
         while (hasMore) {
             DeliveryPage page = repo.findPage(new TenantId(clientId),
-                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursor),
+                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Set.of(), cursor),
                     10);
             for (Delivery d : page.deliveries()) {
                 assertThat(seen.add(d.deliveryId())).as("no duplicates").isTrue();
@@ -172,7 +172,7 @@ class DeliveryFindPageTest {
         boolean hasMore = true;
         while (hasMore) {
             DeliveryPage page = repo.findPage(new TenantId(clientId),
-                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursor),
+                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Set.of(), cursor),
                     3);
             for (Delivery d : page.deliveries()) {
                 assertThat(seen.add(d.deliveryId())).as("no duplicates in fan-out").isTrue();
@@ -219,26 +219,26 @@ class DeliveryFindPageTest {
 
         // from only (inclusive): ts itself is included (>= from)
         DeliveryPage fromOnly = repo.findPage(new TenantId(clientId),
-                new DeliveryPageQuery(Optional.of(ts), Optional.empty(), Optional.empty(), Optional.empty()),
+                new DeliveryPageQuery(Optional.of(ts), Optional.empty(), Set.of(), Optional.empty()),
                 10);
         assertThat(fromOnly.deliveries().stream().map(Delivery::deliveryId)).contains(id);
 
         // from after ts: excluded
         DeliveryPage fromAfter = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.of(ts.plus(1, ChronoUnit.SECONDS)), Optional.empty(),
-                        Optional.empty(), Optional.empty()),
+                        Set.of(), Optional.empty()),
                 10);
         assertThat(fromAfter.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(id);
 
         // to only (exclusive): ts+1s is included; ts itself excluded when to=ts
         DeliveryPage toExclusive = repo.findPage(new TenantId(clientId),
-                new DeliveryPageQuery(Optional.empty(), Optional.of(ts), Optional.empty(), Optional.empty()),
+                new DeliveryPageQuery(Optional.empty(), Optional.of(ts), Set.of(), Optional.empty()),
                 10);
         assertThat(toExclusive.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(id);
 
         DeliveryPage toAfter = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.of(ts.plus(1, ChronoUnit.SECONDS)),
-                        Optional.empty(), Optional.empty()),
+                        Set.of(), Optional.empty()),
                 10);
         assertThat(toAfter.deliveries().stream().map(Delivery::deliveryId)).contains(id);
     }
@@ -253,7 +253,7 @@ class DeliveryFindPageTest {
         // Status=PENDING only
         DeliveryPage pendingPage = repo.findPage(new TenantId(clientId),
                 new DeliveryPageQuery(Optional.empty(), Optional.empty(),
-                        Optional.of(DeliveryStatus.PENDING), Optional.empty()),
+                        Set.of(DeliveryStatus.PENDING), Optional.empty()),
                 10);
         assertThat(pendingPage.deliveries().stream().map(Delivery::deliveryId)).contains(pending);
         assertThat(pendingPage.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(delivered);
@@ -263,7 +263,7 @@ class DeliveryFindPageTest {
                 new DeliveryPageQuery(
                         Optional.of(ts.minus(1, ChronoUnit.MINUTES)),
                         Optional.of(ts.plus(1, ChronoUnit.MINUTES)),
-                        Optional.of(DeliveryStatus.PENDING), Optional.empty()),
+                        Set.of(DeliveryStatus.PENDING), Optional.empty()),
                 10);
         assertThat(combined.deliveries().stream().map(Delivery::deliveryId)).contains(pending);
         assertThat(combined.deliveries().stream().map(Delivery::deliveryId)).doesNotContain(delivered);
@@ -290,15 +290,15 @@ class DeliveryFindPageTest {
                 repo.findPage(new TenantId(clientId), DeliveryPageQuery.unfiltered(), 50),
                 repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.of(ts.minus(1, ChronoUnit.HOURS)), Optional.empty(),
-                                Optional.empty(), Optional.empty()),
+                                Set.of(), Optional.empty()),
                         50),
                 repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.empty(), Optional.of(ts.plus(1, ChronoUnit.HOURS)),
-                                Optional.empty(), Optional.empty()),
+                                Set.of(), Optional.empty()),
                         50),
                 repo.findPage(new TenantId(clientId),
                         new DeliveryPageQuery(Optional.empty(), Optional.empty(),
-                                Optional.of(DeliveryStatus.PENDING), Optional.empty()),
+                                Set.of(DeliveryStatus.PENDING), Optional.empty()),
                         50)
         );
 
@@ -337,7 +337,7 @@ class DeliveryFindPageTest {
         if (cursorFromA.isPresent()) {
             // Tenant B uses that cursor — should only return tenant B rows
             DeliveryPage pageB = repo.findPage(new TenantId(tenantB),
-                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(), cursorFromA),
+                    new DeliveryPageQuery(Optional.empty(), Optional.empty(), Set.of(), cursorFromA),
                     10);
             assertThat(pageB.deliveries().stream().map(Delivery::deliveryId))
                     .doesNotContainAnyElementsOf(pageA.deliveries().stream()
@@ -349,7 +349,7 @@ class DeliveryFindPageTest {
     @Test
     void findPage_malformedCursor_propagatesException_notPage1() {
         assertThatThrownBy(() -> repo.findPage(new TenantId(clientId),
-                new DeliveryPageQuery(Optional.empty(), Optional.empty(), Optional.empty(),
+                new DeliveryPageQuery(Optional.empty(), Optional.empty(), Set.of(),
                         Optional.of("not-a-valid-cursor!!!")),
                 10))
                 .isInstanceOf(DeliveryPageCursor.MalformedCursorException.class);

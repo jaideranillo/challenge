@@ -11,6 +11,7 @@ import com.cobre.challenge.application.port.in.selfservice.dto.ReplayDeliveryCom
 import com.cobre.challenge.domain.model.delivery.Delivery;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryOrigin;
 import com.cobre.challenge.domain.model.delivery.enums.DeliveryStatus;
+import com.cobre.challenge.domain.model.delivery.enums.PublicDeliveryStatus;
 import com.cobre.challenge.domain.model.event.NotificationEvent;
 import com.cobre.challenge.domain.model.tenant.TenantId;
 import java.time.Instant;
@@ -32,8 +33,8 @@ class QueryGetReplayUseCasePortsTest {
     void queryCommandStatusFilterIsTypedNotString() {
         QueryNotificationEventsCommand command = new QueryNotificationEventsCommand(
                 new TenantId("client-1"), Optional.empty(), Optional.empty(),
-                Optional.of(DeliveryStatus.PENDING), Optional.empty(), 50);
-        assertThat(command.status()).contains(DeliveryStatus.PENDING);
+                Optional.of(PublicDeliveryStatus.PENDING), Optional.empty(), 50);
+        assertThat(command.status()).contains(PublicDeliveryStatus.PENDING);
     }
 
     @Test
